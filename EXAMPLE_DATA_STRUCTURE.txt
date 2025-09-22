@@ -1,0 +1,11 @@
+Example dataset structure (do NOT store real patient data in public repos without approvals).
+FUNDUS/
+  Healthy/
+    1001_OD.jpg
+    1001_OS.jpg
+  Parkinson/
+    2001_OD.jpg
+    2001_OS.jpg
+Excels/
+  final_nodisease.xlsx
+  final_parkinson.xlsx

@@ -1,0 +1,4 @@
+The user-provided full original script (kept unmodified here for reference).
+Place any missing pieces into sight_and_insights.py as you refine the implementation.
+
+Original script was provided in the conversation and is included in the repo as a separate file by the author.

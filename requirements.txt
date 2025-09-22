@@ -1,0 +1,12 @@
+tensorflow>=2.11.0
+scikit-learn>=1.1.3
+numpy>=1.23.0
+pandas>=1.4.0
+opencv-python
+scikit-image
+shap
+lime
+matplotlib
+seaborn
+joblib
+openpyxl
