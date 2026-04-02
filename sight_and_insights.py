@@ -1,1171 +1,1288 @@
 """
-Sight & Insights: Multimodal Retinal AI for Parkinson's Disease Risk Stratification
-Code implementation of the paper: https://doi.org/xxxx
+Sight & Insights: Bilateral Fundus AI for Participant-Level Parkinson's Disease Risk Stratification
+-----------------------------------------------------------------------------------------------
+A clean, GitHub-ready TensorFlow/Keras implementation aligned with the fundus-only methods in the thesis/paper:
 
-This implementation includes:
-1. Image-only branch (fundus photography)
-2. Tabular-only branch (clinical/OCT data)
-3. Multimodal fusion branch
-4. Calibration and threshold selection
-5. Model evaluation metrics
-6. XAI (Explainable AI) module with SHAP, Grad-CAM, and vessel-aware LIME
+- Bilateral color fundus photographs
+- Shared-weight dual-stream EfficientNetV2-B1 encoder
+- Channel + spatial attention (CBAM-style)
+- Multi-scale convolutional blocks
+- Participant-level score averaging
+- Focal loss + adaptive class weighting
+- Extensive on-the-fly augmentation
+- Stratified group cross-validation on TRAIN
+- Frozen hold-out evaluation
+- Isotonic calibration and frozen threshold selection
+- Explainable AI: Grad-CAM, attention maps, vessel-aware LIME
 
-Author: Zohreh Ganji et al.
+Notes
+-----
+1) This script assumes a folder structure like:
+   data/
+     Healthy/
+     Parkinson/
+   with filenames containing participant ID and eye side, e.g.:
+   90129_OD.png, 90129_OS.png
+
+2) Age/sex may be present in an optional metadata CSV/Excel for overlap weighting.
+   They are NOT used as predictive features.
+
+3) The code is designed to be readable and reproducible for GitHub, not to be the shortest possible implementation.
+   Depending on the exact dataset naming convention, you may need to adjust `parse_participant_id_and_eye`.
+
+Author: Zohreh Ganji
 License: MIT
 """
 
-import os
-import re
+from __future__ import annotations
+
+import argparse
 import json
 import math
+import os
 import random
+import re
 import warnings
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import (
-    confusion_matrix, roc_curve, precision_recall_curve,
-    roc_auc_score, average_precision_score, brier_score_loss
-)
-from sklearn.calibration import calibration_curve
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import KNNImputer
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.decomposition import PCA
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import cv2
 import joblib
 import matplotlib.pyplot as plt
-import seaborn as sns
-import cv2
-from skimage import exposure, color, segmentation
-from skimage.filters import frangi
-from lime import lime_image
+import numpy as np
+import pandas as pd
 import shap
-
-# Keras imports
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, Dense, GlobalAveragePooling2D, BatchNormalization, Dropout,
-    Concatenate, Multiply, LayerNormalization, MultiHeadAttention,
-    Reshape, Conv1D, MaxPooling1D, Add, Flatten
+import tensorflow as tf
+from lime import lime_image
+from matplotlib import patches
+from sklearn.calibration import calibration_curve
+from sklearn.impute import KNNImputer
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
 )
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+from skimage.filters import frangi
+from skimage import color, segmentation
+from tensorflow.keras import Model
 from tensorflow.keras.applications import EfficientNetV2B1
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import (
-    EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
+from tensorflow.keras.layers import (
+    Add,
+    Average,
+    BatchNormalization,
+    Concatenate,
+    Conv2D,
+    Dense,
+    Dropout,
+    GlobalAveragePooling2D,
+    Input,
+    Lambda,
+    Layer,
+    Multiply,
 )
+from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.regularizers import l2
-from tensorflow.keras.initializers import HeNormal
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 
 # ======================
-# CONFIGURATION
+# Configuration
 # ======================
+
+@dataclass
 class Config:
-    # Data paths
-    IMAGE_DIR = '/content/drive/MyDrive/FUNDUS'  # Contains Healthy/ and Parkinson/ subfolders
-    TABULAR_DIR = '/content/drive/MyDrive/Excels'  # Contains clinical Excel files
-    SAVE_DIR = '/content/drive/MyDrive/models'
-    XAI_DIR = '/content/drive/MyDrive/xai_results'
+    data_dir: str = "./data"
+    output_dir: str = "./outputs_fundus"
+    metadata_path: Optional[str] = None  # Optional CSV/XLSX with age, sex, participant_id, label
 
-    # Model parameters
-    IMAGE_SIZE = (256, 256)
-    BATCH_SIZE = 8
-    EPOCHS = 30
-    LEARNING_RATE = 3e-4
-    HOLDOUT_SPLIT = 0.2
-    FOLDS = 5
+    image_size: Tuple[int, int] = (256, 256)
+    batch_size: int = 8
+    epochs: int = 30
+    learning_rate: float = 3e-4
+    weight_decay_l2: float = 1e-5
+    dropout_rate: float = 0.4
+    freeze_layers: int = 200
 
-    # Calibration
-    MIN_SENSITIVITY = 0.70
-    MIN_SPECIFICITY = 0.70
+    random_seed: int = 42
+    holdout_split: float = 0.2
+    folds: int = 5
 
-    # Regularization
-    DROPOUT_RATE = 0.4
-    L2_REG = 1e-5
+    # Constraint-based thresholding
+    min_sensitivity_fundus: float = 0.70
+    min_specificity_fundus: float = 0.70
 
-    # Feature selection
-    FEATURE_SELECTION_K = 35
+    # Augmentation
+    rotation_deg: float = 45.0
+    shift_frac: float = 0.20
+    shear_frac: float = 0.20
+    zoom_frac: float = 0.30
+    brightness_low: float = 0.70
+    brightness_high: float = 1.30
 
-    # Mixed precision
-    MIXED_PRECISION = True
+    # XAI
+    xai_samples: int = 5
+    lime_samples: int = 1000
+    vessel_threshold: float = 0.10
 
-    # XAI parameters
-    SHAP_SAMPLES = 100  # Number of samples for SHAP explanation
-    GRADCAM_LAYER_NAME = 'top_conv'  # Layer for Grad-CAM
-    LIME_SAMPLES = 1000  # Number of samples for LIME
-    VESSEL_THRESHOLD = 0.1  # Threshold for vessel detection
-
-    # Set random seeds
-    RANDOM_SEED = 42
-
-
-# ======================
-# IMAGE PREPROCESSING
-# ======================
-def retina_preprocessing(img):
-    """
-    Retina-specific preprocessing pipeline for fundus photographs.
-    Includes CLAHE enhancement and vessel masking.
-
-    Args:
-        img: Input image (numpy array)
-
-    Returns:
-        Preprocessed image (numpy array)
-    """
-    try:
-        # Convert to LAB color space and apply CLAHE to L channel
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced_l = clahe.apply(l)
-        enhanced_lab = cv2.merge([enhanced_l, a, b])
-        img = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-
-        # Vessel enhancement using green channel
-        green = img[:, :, 1]
-        blurred = cv2.GaussianBlur(green, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Create mask from thresholding
-        mask = np.stack([thresh] * 3, axis=-1)
-        img = cv2.bitwise_and(img, mask)
-
-        # Resize and normalize
-        img = cv2.resize(img, Config.IMAGE_SIZE)
-        return img.astype('float32') / 255.0
-
-    except Exception as e:
-        print(f"Preprocessing error: {str(e)}")
-        return np.zeros((*Config.IMAGE_SIZE, 3), dtype='float32')
+    # Misc
+    mixed_precision: bool = True
+    class_names: Tuple[str, str] = ("Healthy", "Parkinson")
 
 
 # ======================
-# TABULAR PREPROCESSING
+# Utilities
 # ======================
-def preprocess_tabular_data(df):
-    """
-    Preprocessing pipeline for clinical/OCT tabular data.
-    Includes feature selection, imputation, scaling, and PCA.
 
-    Args:
-        df: Input DataFrame with clinical features
 
-    Returns:
-        Processed features (numpy array), labels (numpy array), 
-        selected feature names (list)
-    """
-    # Separate features and labels
-    y = df['label'].values
-    X = df.drop('label', axis=1).select_dtypes(include=np.number)
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
 
-    # Feature selection using mutual information
-    selector = SelectKBest(score_func=mutual_info_classif, k=Config.FEATURE_SELECTION_K)
-    X_selected = selector.fit_transform(X, y)
-    selected_features = X.columns[selector.get_support()]
 
-    # Impute missing values
-    imputer = KNNImputer(n_neighbors=7)
-    X_imputed = imputer.fit_transform(X_selected)
+def ensure_dir(path: str | Path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    # Scale features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_imputed)
 
-    # Dimensionality reduction with PCA
-    pca = PCA(n_components=0.95)  # Retain 95% variance
-    X_pca = pca.fit_transform(X_scaled)
+def write_json(path: str | Path, obj: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
-    print(f"Selected {len(selected_features)} features, reduced to {X_pca.shape[1]} components")
-    return X_pca, y, selected_features
+
+def wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+    if n == 0:
+        return (0.0, 0.0)
+    phat = k / n
+    denom = 1 + z**2 / n
+    center = (phat + z**2 / (2 * n)) / denom
+    margin = z * math.sqrt((phat * (1 - phat) + z**2 / (4 * n)) / n) / denom
+    lo = max(0.0, center - margin)
+    hi = min(1.0, center + margin)
+    return lo, hi
 
 
 # ======================
-# MODEL ARCHITECTURES
+# Data parsing and pairing
 # ======================
 
-def build_image_model():
+
+def parse_participant_id_and_eye(filename: str) -> Tuple[str, Optional[str]]:
+    """Parse participant ID and eye side from filename.
+
+    Supports patterns such as:
+      90129_OD.png
+      90129_OS.jpg
+      90129-right.jpeg
+      P90129_left.bmp
+
+    Returns
+    -------
+    participant_id, eye_side
+        eye_side is 'OD', 'OS', or None if not found.
     """
-    Image-only branch using EfficientNetV2-B1 backbone.
-    Includes channel attention and multi-scale feature extraction.
+    stem = Path(filename).stem
+    eye = None
 
-    Returns:
-        Keras Model
-    """
-    # Base model
-    base = EfficientNetV2B1(
-        include_top=False,
-        weights='imagenet',
-        input_shape=(*Config.IMAGE_SIZE, 3)
-    )
+    eye_patterns = {
+        r"(?:^|[_\-\s])(OD|od|R|right)(?:$|[_\-\s])": "OD",
+        r"(?:^|[_\-\s])(OS|os|L|left)(?:$|[_\-\s])": "OS",
+    }
+    for pat, value in eye_patterns.items():
+        if re.search(pat, stem):
+            eye = value
+            break
 
-    # Freeze early layers
-    for layer in base.layers[:200]:
-        layer.trainable = False
+    # Remove eye tokens and trailing separators to infer ID.
+    cleaned = re.sub(r"(?:[_\-\s]?)(?:OD|od|OS|os|R|r|L|l|right|left)(?:[_\-\s]?)", "_", stem)
+    cleaned = re.sub(r"[_\-\s]+", "_", cleaned).strip("_")
 
-    # Input layer
-    inputs = Input(shape=(*Config.IMAGE_SIZE, 3))
-    x = base(inputs)
-
-    # Channel attention module
-    avg_pool = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
-    max_pool = tf.reduce_max(x, axis=[1, 2], keepdims=True)
-    concat = Concatenate(axis=-1)([avg_pool, max_pool])
-    fc1 = Dense(x.shape[-1] // 8, activation='relu')(concat)
-    fc2 = Dense(x.shape[-1], activation='sigmoid')(fc1)
-    scale = Multiply()([x, fc2])
-
-    # Multi-scale feature extraction
-    conv1 = Conv2D(128, (1, 1), padding='same', activation='swish')(scale)
-    conv3 = Conv2D(128, (3, 3), padding='same', activation='swish')(scale)
-    conv5 = Conv2D(128, (5, 5), padding='same', activation='swish')(scale)
-    x = Concatenate()([conv1, conv3, conv5])
-
-    # Global pooling and classification head
-    x = GlobalAveragePooling2D()(x)
-    x = Dropout(Config.DROPOUT_RATE)(x)
-    x = Dense(256, activation='swish', kernel_regularizer=l2(Config.L2_REG))(x)
-    x = BatchNormalization()(x)
-    outputs = Dense(1, activation='sigmoid')(x)
-
-    return Model(inputs, outputs, name='Image_Branch')
+    # If filename starts with letters and numbers, keep the first token.
+    tokens = cleaned.split("_")
+    participant_id = tokens[0] if tokens else cleaned
+    return participant_id, eye
 
 
-def build_tabular_model(input_shape):
-    """
-    Tabular-only branch with ensemble of three submodels:
-    1. Residual MLP
-    2. Token self-attention
-    3. 1D-CNN
+def build_image_dataframe(data_dir: str, class_names: Sequence[str] = ("Healthy", "Parkinson")) -> pd.DataFrame:
+    rows: List[dict] = []
+    data_root = Path(data_dir)
 
-    Args:
-        input_shape: Number of input features
-
-    Returns:
-        Keras Model
-    """
-    inputs = Input(shape=(input_shape,))
-
-    # Submodel 1: Residual MLP
-    x1 = Dense(256, activation='swish', kernel_regularizer=l2(Config.L2_REG))(inputs)
-    x1 = BatchNormalization()(x1)
-    x1 = Dropout(Config.DROPOUT_RATE)(x1)
-    residual = x1
-    x1 = Dense(256, activation='swish', kernel_regularizer=l2(Config.L2_REG))(x1)
-    x1 = BatchNormalization()(x1)
-    x1 = Dropout(Config.DROPOUT_RATE)(x1)
-    x1 = Add()([x1, residual])
-    out1 = Dense(1, activation='sigmoid')(x1)
-
-    # Submodel 2: Token self-attention
-    x2 = Reshape((-1, 1))(inputs)
-    attn = MultiHeadAttention(num_heads=8, key_dim=32)(x2, x2)
-    x2 = LayerNormalization()(attn)
-    x2 = GlobalAveragePooling1D()(x2)
-    x2 = Dense(128, activation='swish')(x2)
-    out2 = Dense(1, activation='sigmoid')(x2)
-
-    # Submodel 3: 1D-CNN
-    x3 = Reshape((-1, 1))(inputs)
-    x3 = Conv1D(80, 3, activation='swish')(x3)
-    x3 = MaxPooling1D(2)(x3)
-    x3 = Conv1D(160, 3, activation='swish')(x3)
-    x3 = GlobalAveragePooling1D()(x3)
-    out3 = Dense(1, activation='sigmoid')(x3)
-
-    # Ensemble outputs
-    outputs = tf.keras.layers.Average()([out1, out2, out3])
-
-    return Model(inputs, outputs, name='Tabular_Branch')
-
-
-def build_fusion_model(image_shape, tabular_shape):
-    """
-    Multimodal fusion model with FiLM modulation.
-    Combines image and tabular branches with end-to-end training.
-
-    Args:
-        image_shape: Input shape for images
-        tabular_shape: Input shape for tabular data
-
-    Returns:
-        Keras Model
-    """
-    # Image branch (shared weights for both eyes)
-    image_input = Input(shape=(*image_shape, 3))
-    base = EfficientNetV2B1(include_top=False, weights='imagenet')
-    x_img = base(image_input)
-    x_img = GlobalAveragePooling2D()(x_img)
-    img_embedding = Dense(256, activation='swish')(x_img)
-
-    # Tabular branch
-    tab_input = Input(shape=(tabular_shape,))
-    x_tab = Dense(128, activation='swish')(tab_input)
-    tab_embedding = Dense(256, activation='swish')(x_tab)
-
-    # FiLM modulation: Use tabular features to modulate image features
-    gamma = Dense(256)(tab_embedding)
-    beta = Dense(256)(tab_embedding)
-    modulated_img = Multiply()([img_embedding, gamma]) + beta
-
-    # Combine modalities
-    combined = Concatenate()([modulated_img, tab_embedding])
-
-    # Classification head
-    x = Dense(256, activation='swish')(combined)
-    x = BatchNormalization()(x)
-    x = Dropout(Config.DROPOUT_RATE)(x)
-    outputs = Dense(1, activation='sigmoid')(x)
-
-    return Model(
-        inputs=[image_input, tab_input],
-        outputs=outputs,
-        name='Fusion_Model'
-    )
-
-
-# ======================
-# CALIBRATION & THRESHOLDING
-# ======================
-
-class IsotonicCalibrator:
-    """Isotonic regression calibrator for probability calibration."""
-
-    def __init__(self):
-        self.iso = None
-
-    def fit(self, scores, y, sample_weight=None):
-        from sklearn.isotonic import IsotonicRegression
-        self.iso = IsotonicRegression(out_of_bounds='clip')
-        self.iso.fit(scores, y, sample_weight=sample_weight)
-        return self
-
-    def predict(self, scores):
-        return self.iso.transform(scores)
-
-
-def find_optimal_threshold(y_true, y_prob, min_sens=0.70, min_spec=0.70):
-    """
-    Find optimal threshold that meets sensitivity and specificity constraints.
-
-    Args:
-        y_true: True labels
-        y_prob: Predicted probabilities
-        min_sens: Minimum sensitivity requirement
-        min_spec: Minimum specificity requirement
-
-    Returns:
-        Optimal threshold (float)
-    """
-    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
-
-    # Find thresholds that meet constraints
-    valid_indices = np.where((tpr >= min_sens) & ((1 - fpr) >= min_spec))[0]
-
-    if len(valid_indices) > 0:
-        # Among valid thresholds, maximize harmonic mean
-        harmonic_mean = 2 * (tpr[valid_indices] * (1 - fpr[valid_indices])) / \
-                        (tpr[valid_indices] + (1 - fpr[valid_indices]))
-        best_idx = valid_indices[np.argmax(harmonic_mean)]
-        return thresholds[best_idx]
-    else:
-        # Fallback: Youden's J statistic
-        youden_j = tpr - fpr
-        return thresholds[np.argmax(youden_j)]
-
-
-# ======================
-# EVALUATION METRICS
-# ======================
-
-def calculate_metrics(y_true, y_prob, threshold):
-    """
-    Calculate comprehensive evaluation metrics.
-
-    Args:
-        y_true: True labels
-        y_prob: Predicted probabilities
-        threshold: Classification threshold
-
-    Returns:
-        Dictionary of metrics
-    """
-    y_pred = (y_prob >= threshold).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-
-    # Core metrics
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
-
-    # AUC metrics
-    roc_auc = roc_auc_score(y_true, y_prob)
-    pr_auc = average_precision_score(y_true, y_prob)
-
-    # Calibration
-    brier = brier_score_loss(y_true, y_prob)
-
-    return {
-        'sensitivity': sensitivity,
-        'specificity': specificity,
-        'ppv': ppv,
-        'npv': npv,
-        'roc_auc': roc_auc,
-        'pr_auc': pr_auc,
-        'brier_score': brier,
-        'threshold': threshold
+    class_map = {
+        class_names[0].lower(): 0,
+        class_names[1].lower(): 1,
+        "healthy": 0,
+        "parkinson": 1,
+        "hc": 0,
+        "pd": 1,
     }
 
-
-# ======================
-# XAI (EXPLAINABLE AI) MODULE
-# ======================
-
-class XAIInterpreter:
-    """
-    XAI interpreter for multimodal model explanations.
-    Implements SHAP for tabular data and Grad-CAM/LIME for images.
-    """
-
-    def __init__(self, model, image_model=None, tabular_model=None, fusion_model=None):
-        """
-        Initialize XAI interpreter with trained models.
-
-        Args:
-            model: Main model (fusion model preferred)
-            image_model: Image-only branch model
-            tabular_model: Tabular-only branch model
-            fusion_model: Fusion model
-        """
-        self.model = model
-        self.image_model = image_model
-        self.tabular_model = tabular_model
-        self.fusion_model = fusion_model
-
-        # Create XAI output directory
-        os.makedirs(Config.XAI_DIR, exist_ok=True)
-
-    def explain_tabular_with_shap(self, X, y, feature_names=None, sample_idx=None):
-        """
-        Explain tabular predictions using SHAP.
-
-        Args:
-            X: Tabular features
-            y: True labels
-            feature_names: List of feature names
-            sample_idx: Index of sample to explain (if None, explains multiple samples)
-
-        Returns:
-            SHAP values and plots
-        """
-        print("Generating SHAP explanations for tabular data...")
-
-        # Use KernelExplainer for tabular data
-        explainer = shap.KernelExplainer(self.model.predict, X)
-
-        if sample_idx is not None:
-            # Explain single sample
-            shap_values = explainer.shap_values(X[sample_idx:sample_idx + 1])
-
-            # Plot explanation
-            plt.figure(figsize=(10, 6))
-            shap.force_plot(
-                explainer.expected_value[0],
-                shap_values[0][0],
-                X[sample_idx],
-                feature_names=feature_names,
-                matplotlib=True,
-                show=False
-            )
-            plt.savefig(os.path.join(Config.XAI_DIR, f'shap_force_plot_{sample_idx}.png'), dpi=300)
-            plt.close()
-        else:
-            # Explain multiple samples
-            shap_values = explainer.shap_values(X[:Config.SHAP_SAMPLES])
-
-            # Summary plot
-            plt.figure(figsize=(12, 8))
-            shap.summary_plot(
-                shap_values[0],
-                X[:Config.SHAP_SAMPLES],
-                feature_names=feature_names,
-                show=False
-            )
-            plt.savefig(os.path.join(Config.XAI_DIR, 'shap_summary_plot.png'), dpi=300, bbox_inches='tight')
-            plt.close()
-
-            # Dependence plots for top features
-            if feature_names is not None:
-                top_features = np.argsort(np.abs(shap_values[0]).mean(0))[-5:]
-                for idx in top_features:
-                    plt.figure(figsize=(10, 6))
-                    shap.dependence_plot(
-                        idx,
-                        shap_values[0],
-                        X[:Config.SHAP_SAMPLES],
-                        feature_names=feature_names,
-                        show=False
-                    )
-                    plt.savefig(os.path.join(Config.XAI_DIR, f'shap_dependence_{feature_names[idx]}.png'), dpi=300)
-                    plt.close()
-
-        return shap_values
-
-    def explain_image_with_gradcam(self, img_array, sample_idx, class_idx=0):
-        """
-        Explain image predictions using Grad-CAM.
-
-        Args:
-            img_array: Preprocessed image array
-            sample_idx: Index of sample
-            class_idx: Class index to explain
-
-        Returns:
-            Grad-CAM heatmap
-        """
-        print(f"Generating Grad-CAM for image {sample_idx}...")
-
-        # Create Grad-CAM model
-        grad_model = Model(
-            inputs=[self.image_model.inputs],
-            outputs=[self.image_model.get_layer(Config.GRADCAM_LAYER_NAME).output, self.image_model.output]
-        )
-
-        # Compute gradients
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array[sample_idx:sample_idx + 1])
-            loss = predictions[:, class_idx]
-
-        # Extract gradients and pooled features
-        grads = tape.gradient(loss, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-        # Weight the channels by importance
-        conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-
-        # Apply ReLU and normalize
-        heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-        heatmap = heatmap.numpy()
-
-        # Resize heatmap to original image size
-        heatmap = cv2.resize(heatmap, Config.IMAGE_SIZE)
-
-        # Create visualization
-        plt.figure(figsize=(12, 5))
-
-        # Original image
-        plt.subplot(1, 2, 1)
-        plt.imshow(img_array[sample_idx])
-        plt.title('Original Image')
-        plt.axis('off')
-
-        # Heatmap overlay
-        plt.subplot(1, 2, 2)
-        plt.imshow(img_array[sample_idx])
-        plt.imshow(heatmap, cmap='jet', alpha=0.5)
-        plt.title('Grad-CAM Heatmap')
-        plt.axis('off')
-
-        plt.savefig(os.path.join(Config.XAI_DIR, f'gradcam_{sample_idx}.png'), dpi=300)
-        plt.close()
-
-        return heatmap
-
-    def extract_vessel_mask(self, img):
-        """
-        Extract vessel mask from fundus image using Frangi filter.
-
-        Args:
-            img: Input image (RGB)
-
-        Returns:
-            Binary vessel mask
-        """
-        # Convert to grayscale
-        gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-
-        # Apply Frangi filter for vessel detection
-        vessels = frangi(gray, scale_range=(1, 3), scale_step=2, beta1=0.5, beta2=15, black_ridges=False)
-
-        # Threshold to create binary mask
-        vessel_mask = (vessels > Config.VESSEL_THRESHOLD).astype(np.uint8)
-
-        return vessel_mask
-
-    def explain_image_with_vessel_aware_lime(self, img_array, sample_idx):
-        """
-        Explain image predictions using vessel-aware LIME.
-
-        Args:
-            img_array: Preprocessed image array
-            sample_idx: Index of sample
-
-        Returns:
-            LIME explanation
-        """
-        print(f"Generating vessel-aware LIME for image {sample_idx}...")
-
-        # Get vessel mask
-        vessel_mask = self.extract_vessel_mask(img_array[sample_idx])
-
-        # Create LIME explainer
-        explainer = lime_image.LimeImageExplainer()
-
-        # Define segmentation function that considers vessels
-        def segmentation_fn(img):
-            # Convert to LAB color space for better segmentation
-            lab = color.rgb2lab(img)
-
-            # Create 4-channel image (RGB + vesselness)
-            vessel_channel = cv2.resize(vessel_mask, (img.shape[1], img.shape[0]))
-            four_channel = np.dstack([img, vessel_channel])
-
-            # Use SLIC superpixels
-            segments = segmentation.slic(four_channel, n_segments=50, compactness=10, sigma=1)
-
-            return segments
-
-        # Generate explanation
-        explanation = explainer.explain_instance(
-            img_array[sample_idx],
-            self.image_model.predict,
-            top_labels=1,
-            hide_color=0,
-            num_samples=Config.LIME_SAMPLES,
-            segmentation_fn=segmentation_fn
-        )
-
-        # Get explanation for the top class
-        temp, mask = explanation.get_image_and_mask(
-            explanation.top_labels[0],
-            positive_only=True,
-            num_features=10,
-            hide_rest=False
-        )
-
-        # Create visualization
-        plt.figure(figsize=(15, 5))
-
-        # Original image
-        plt.subplot(1, 3, 1)
-        plt.imshow(img_array[sample_idx])
-        plt.title('Original Image')
-        plt.axis('off')
-
-        # Vessel mask
-        plt.subplot(1, 3, 2)
-        plt.imshow(vessel_mask, cmap='gray')
-        plt.title('Vessel Mask')
-        plt.axis('off')
-
-        # LIME explanation
-        plt.subplot(1, 3, 3)
-        plt.imshow(mark_boundaries(temp / 255.0, mask))
-        plt.title('Vessel-Aware LIME')
-        plt.axis('off')
-
-        plt.savefig(os.path.join(Config.XAI_DIR, f'lime_vessel_aware_{sample_idx}.png'), dpi=300)
-        plt.close()
-
-        return explanation
-
-    def residual_shap_analysis(self, X_img, X_tab, y, feature_names=None):
-        """
-        Perform residual SHAP analysis to quantify laboratory signal independent of OCT.
-
-        Args:
-            X_img: Image features
-            X_tab: Tabular features
-            y: True labels
-            feature_names: List of feature names
-
-        Returns:
-            Residual SHAP values
-        """
-        print("Performing residual SHAP analysis...")
-
-        # First, get predictions from image model
-        img_predictions = self.image_model.predict(X_img)
-
-        # Compute residuals (what tabular model explains beyond images)
-        residuals = y - img_predictions.flatten()
-
-        # Create a new model to explain residuals
-        residual_model = Model(
-            inputs=self.tabular_model.inputs,
-            outputs=self.tabular_model.outputs
-        )
-
-        # Use SHAP to explain the residuals
-        explainer = shap.KernelExplainer(residual_model.predict, X_tab)
-        shap_values = explainer.shap_values(X_tab[:Config.SHAP_SAMPLES])
-
-        # Plot residual SHAP values
-        plt.figure(figsize=(12, 8))
-        shap.summary_plot(
-            shap_values[0],
-            X_tab[:Config.SHAP_SAMPLES],
-            feature_names=feature_names,
-            show=False,
-            title="Residual SHAP (Tabular signal independent of OCT)"
-        )
-        plt.savefig(os.path.join(Config.XAI_DIR, 'residual_shap_summary.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-
-        return shap_values
-
-    def generate_xai_report(self, X_img, X_tab, y, feature_names=None):
-        """
-        Generate comprehensive XAI report for the multimodal model.
-
-        Args:
-            X_img: Image features or images
-            X_tab: Tabular features
-            y: True labels
-            feature_names: List of feature names
-        """
-        print("Generating comprehensive XAI report...")
-
-        # 1. Tabular SHAP explanations
-        self.explain_tabular_with_shap(X_tab, y, feature_names)
-
-        # 2. Image Grad-CAM explanations (for a few samples)
-        sample_indices = np.random.choice(len(X_img), min(5, len(X_img)), replace=False)
-        for idx in sample_indices:
-            self.explain_image_with_gradcam(X_img, idx)
-
-        # 3. Vessel-aware LIME explanations
-        for idx in sample_indices:
-            self.explain_image_with_vessel_aware_lime(X_img, idx)
-
-        # 4. Residual SHAP analysis
-        self.residual_shap_analysis(X_img, X_tab, y, feature_names)
-
-        # 5. Create summary report
-        self.create_xai_summary_report()
-
-        print(f"XAI report saved to {Config.XAI_DIR}")
-
-    def create_xai_summary_report(self):
-        """
-        Create a summary report of all XAI analyses.
-        """
-        report_path = os.path.join(Config.XAI_DIR, 'xai_summary_report.html')
-
-        with open(report_path, 'w') as f:
-            f.write("""
-            <html>
-            <head>
-                <title>XAI Summary Report - Sight & Insights</title>
-                <style>
-                    body { font-family: Arial, sans-serif; margin: 20px; }
-                    h1 { color: #2c3e50; }
-                    h2 { color: #3498db; }
-                    img { max-width: 100%; margin: 10px 0; }
-                    .section { margin: 30px 0; }
-                </style>
-            </head>
-            <body>
-                <h1>XAI Summary Report - Sight & Insights</h1>
-
-                <div class="section">
-                    <h2>1. Tabular Feature Importance (SHAP)</h2>
-                    <p>This section shows the importance of each clinical/OCT feature in the model's predictions.</p>
-                    <img src="shap_summary_plot.png" alt="SHAP Summary Plot">
-                </div>
-
-                <div class="section">
-                    <h2>2. Image Explanations (Grad-CAM)</h2>
-                    <p>Grad-CAM visualizations show which regions of the fundus images are most important for predictions.</p>
-                    <p>Example Grad-CAM visualizations:</p>
-                    <img src="gradcam_0.png" alt="Grad-CAM Example">
-                </div>
-
-                <div class="section">
-                    <h2>3. Vessel-Aware LIME Explanations</h2>
-                    <p>LIME explanations with vessel awareness show how retinal vessels contribute to predictions.</p>
-                    <img src="lime_vessel_aware_0.png" alt="Vessel-Aware LIME Example">
-                </div>
-
-                <div class="section">
-                    <h2>4. Residual SHAP Analysis</h2>
-                    <p>This analysis shows the contribution of laboratory features independent of OCT measurements.</p>
-                    <img src="residual_shap_summary.png" alt="Residual SHAP Analysis">
-                </div>
-
-                <div class="section">
-                    <h2>5. Key Findings</h2>
-                    <ul>
-                        <li>OCT features (especially foveal thickness/volume) are the strongest predictors</li>
-                        <li>Peripapillary regions in fundus images show high saliency</li>
-                        <li>Laboratory features add minimal value once OCT is present</li>
-                        <li>Vessel structures contribute to image-based predictions</li>
-                    </ul>
-                </div>
-            </body>
-            </html>
-            """)
-
-        print(f"XAI summary report saved to {report_path}")
-
-
-# ======================
-# TRAINING PIPELINES
-# ======================
-
-def train_image_branch(train_df, val_df):
-    """
-    Train and evaluate the image-only branch.
-
-    Args:
-        train_df: Training DataFrame with image paths and labels
-        val_df: Validation DataFrame
-
-    Returns:
-        Trained model, evaluation metrics
-    """
-    # Create data generators
-    train_datagen = ImageDataGenerator(
-        rotation_range=45,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=0.3,
-        horizontal_flip=True,
-        vertical_flip=True,
-        brightness_range=[0.7, 1.3],
-        preprocessing_function=retina_preprocessing
-    )
-
-    val_datagen = ImageDataGenerator(preprocessing_function=retina_preprocessing)
-
-    train_flow = train_datagen.flow_from_dataframe(
-        train_df,
-        x_col='path',
-        y_col='label',
-        target_size=Config.IMAGE_SIZE,
-        batch_size=Config.BATCH_SIZE,
-        class_mode='binary'
-    )
-
-    val_flow = val_datagen.flow_from_dataframe(
-        val_df,
-        x_col='path',
-        y_col='label',
-        target_size=Config.IMAGE_SIZE,
-        batch_size=Config.BATCH_SIZE,
-        class_mode='binary',
-        shuffle=False
-    )
-
-    # Build and compile model
-    model = build_image_model()
-    model.compile(
-        optimizer=Adam(learning_rate=Config.LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC(name='pr_auc', curve='PR')]
-    )
-
-    # Train model
-    history = model.fit(
-        train_flow,
-        epochs=Config.EPOCHS,
-        validation_data=val_flow,
-        callbacks=[
-            EarlyStopping(monitor='val_pr_auc', patience=5, mode='max', restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
-        ]
-    )
-
-    # Evaluate
-    val_flow.reset()
-    y_true = val_flow.classes
-    y_prob = model.predict(val_flow).flatten()
-
-    # Calibrate probabilities
-    calibrator = IsotonicCalibrator().fit(y_prob, y_true)
-    y_cal = calibrator.predict(y_prob)
-
-    # Find optimal threshold
-    threshold = find_optimal_threshold(y_true, y_cal)
-
-    # Calculate metrics
-    metrics = calculate_metrics(y_true, y_cal, threshold)
-
-    return model, calibrator, threshold, metrics, val_flow
-
-
-def train_tabular_branch(X_train, y_train, X_val, y_val):
-    """
-    Train and evaluate the tabular-only branch.
-
-    Args:
-        X_train: Training features
-        y_train: Training labels
-        X_val: Validation features
-        y_val: Validation labels
-
-    Returns:
-        Trained model, evaluation metrics
-    """
-    # Build and compile model
-    model = build_tabular_model(X_train.shape[1])
-    model.compile(
-        optimizer=Adam(learning_rate=Config.LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC(name='pr_auc', curve='PR')]
-    )
-
-    # Train model
-    history = model.fit(
-        X_train, y_train,
-        epochs=Config.EPOCHS,
-        batch_size=Config.BATCH_SIZE,
-        validation_data=(X_val, y_val),
-        callbacks=[
-            EarlyStopping(monitor='val_pr_auc', patience=5, mode='max', restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
-        ]
-    )
-
-    # Evaluate
-    y_prob = model.predict(X_val).flatten()
-
-    # Calibrate probabilities
-    calibrator = IsotonicCalibrator().fit(y_prob, y_val)
-    y_cal = calibrator.predict(y_prob)
-
-    # Find optimal threshold
-    threshold = find_optimal_threshold(y_val, y_cal)
-
-    # Calculate metrics
-    metrics = calculate_metrics(y_val, y_cal, threshold)
-
-    return model, calibrator, threshold, metrics
-
-
-def train_fusion_branch(image_train, tabular_train, y_train,
-                        image_val, tabular_val, y_val):
-    """
-    Train and evaluate the multimodal fusion branch.
-
-    Args:
-        image_train: Training images (array or generator)
-        tabular_train: Training tabular features
-        y_train: Training labels
-        image_val: Validation images
-        tabular_val: Validation tabular features
-        y_val: Validation labels
-
-    Returns:
-        Trained model, evaluation metrics
-    """
-    # Build and compile model
-    model = build_fusion_model(Config.IMAGE_SIZE, tabular_train.shape[1])
-    model.compile(
-        optimizer=Adam(learning_rate=Config.LEARNING_RATE),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC(name='pr_auc', curve='PR')]
-    )
-
-    # Train model
-    history = model.fit(
-        [image_train, tabular_train], y_train,
-        epochs=Config.EPOCHS,
-        batch_size=Config.BATCH_SIZE,
-        validation_data=([image_val, tabular_val], y_val),
-        callbacks=[
-            EarlyStopping(monitor='val_pr_auc', patience=5, mode='max', restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
-        ]
-    )
-
-    # Evaluate
-    y_prob = model.predict([image_val, tabular_val]).flatten()
-
-    # Calibrate probabilities
-    calibrator = IsotonicCalibrator().fit(y_prob, y_val)
-    y_cal = calibrator.predict(y_prob)
-
-    # Find optimal threshold with stricter constraints
-    threshold = find_optimal_threshold(y_val, y_cal, min_sens=0.90, min_spec=0.90)
-
-    # Calculate metrics
-    metrics = calculate_metrics(y_val, y_cal, threshold)
-
-    return model, calibrator, threshold, metrics
-
-
-# ======================
-# MAIN EXECUTION
-# ======================
-
-def main():
-    """Main execution pipeline."""
-    # Set random seeds
-    np.random.seed(Config.RANDOM_SEED)
-    tf.random.set_seed(Config.RANDOM_SEED)
-    random.seed(Config.RANDOM_SEED)
-
-    # Create output directories
-    os.makedirs(Config.SAVE_DIR, exist_ok=True)
-    os.makedirs(Config.XAI_DIR, exist_ok=True)
-
-    print("Loading and preprocessing data...")
-
-    # 1. Load image data
-    image_df = build_image_dataframe(Config.IMAGE_DIR)
-
-    # 2. Load tabular data
-    healthy_df = pd.read_excel(os.path.join(Config.TABULAR_DIR, 'final_nodisease.xlsx'))
-    pd_df = pd.read_excel(os.path.join(Config.TABULAR_DIR, 'final_parkinson.xlsx'))
-
-    # Add labels
-    healthy_df['label'] = 0
-    pd_df['label'] = 1
-    tabular_df = pd.concat([healthy_df, pd_df], ignore_index=True)
-
-    # 3. Preprocess tabular data
-    X_tab, y_tab, selected_features = preprocess_tabular_data(tabular_df)
-
-    # 4. Split data (participant-level)
-    # For images: Split by participant_id
-    participant_ids = image_df['participant_id'].unique()
-    train_ids, val_ids = train_test_split(
-        participant_ids,
-        test_size=Config.HOLDOUT_SPLIT,
-        stratify=image_df.groupby('participant_id')['label'].first(),
-        random_state=Config.RANDOM_SEED
-    )
-
-    train_img_df = image_df[image_df['participant_id'].isin(train_ids)]
-    val_img_df = image_df[image_df['participant_id'].isin(val_ids)]
-
-    # For tabular: Use same split
-    train_idx = tabular_df[tabular_df['id'].isin(train_ids)].index
-    val_idx = tabular_df[tabular_df['id'].isin(val_ids)].index
-
-    X_tab_train, y_tab_train = X_tab[train_idx], y_tab[train_idx]
-    X_tab_val, y_tab_val = X_tab[val_idx], y_tab[val_idx]
-
-    print(f"Training samples: {len(train_img_df)} images, {len(X_tab_train)} tabular")
-    print(f"Validation samples: {len(val_img_df)} images, {len(X_tab_val)} tabular")
-
-    # 5. Train image-only branch
-    print("\nTraining image-only branch...")
-    img_model, img_cal, img_thr, img_metrics, val_flow = train_image_branch(train_img_df, val_img_df)
-    print("Image-only metrics:", img_metrics)
-
-    # 6. Train tabular-only branch
-    print("\nTraining tabular-only branch...")
-    tab_model, tab_cal, tab_thr, tab_metrics = train_tabular_branch(X_tab_train, y_tab_train, X_tab_val, y_tab_val)
-    print("Tabular-only metrics:", tab_metrics)
-
-    # 7. Prepare data for fusion
-    # For images: Use preprocessed validation images
-    val_flow.reset()
-    image_val_features = img_model.predict(val_flow, verbose=1)
-
-    # 8. Train fusion branch
-    print("\nTraining fusion branch...")
-    fusion_model, fusion_cal, fusion_thr, fusion_metrics = train_fusion_branch(
-        image_val_features, X_tab_val, y_tab_val,
-        image_val_features, X_tab_val, y_tab_val
-    )
-    print("Fusion metrics:", fusion_metrics)
-
-    # 9. XAI Analysis
-    print("\nGenerating XAI explanations...")
-    xai_interpreter = XAIInterpreter(
-        model=fusion_model,
-        image_model=img_model,
-        tabular_model=tab_model,
-        fusion_model=fusion_model
-    )
-
-    # Get validation images for XAI
-    val_images = []
-    val_flow.reset()
-    for i in range(len(val_flow)):
-        batch = next(val_flow)
-        if i == 0:
-            val_images = batch[0]
-        else:
-            val_images = np.vstack([val_images, batch[0]])
-
-    # Generate comprehensive XAI report
-    xai_interpreter.generate_xai_report(
-        X_img=val_images,
-        X_tab=X_tab_val,
-        y=y_tab_val,
-        feature_names=selected_features
-    )
-
-    # 10. Save results
-    results = {
-        'image_only': {
-            'metrics': img_metrics,
-            'threshold': img_thr
-        },
-        'tabular_only': {
-            'metrics': tab_metrics,
-            'threshold': tab_thr
-        },
-        'fusion': {
-            'metrics': fusion_metrics,
-            'threshold': fusion_thr
-        }
-    }
-
-    with open(os.path.join(Config.SAVE_DIR, 'results.json'), 'w') as f:
-        json.dump(results, f, indent=2)
-
-    # Save models
-    img_model.save(os.path.join(Config.SAVE_DIR, 'image_model.h5'))
-    tab_model.save(os.path.join(Config.SAVE_DIR, 'tabular_model.h5'))
-    fusion_model.save(os.path.join(Config.SAVE_DIR, 'fusion_model.h5'))
-
-    print("\nTraining complete. Models and results saved to:", Config.SAVE_DIR)
-    print("XAI explanations saved to:", Config.XAI_DIR)
-
-
-def build_image_dataframe(source_dir: str) -> pd.DataFrame:
-    """
-    Build DataFrame from image directory structure.
-
-    Args:
-        source_dir: Directory containing class subdirectories
-
-    Returns:
-        DataFrame with image paths and labels
-    """
-    rows = []
-    for cls, lab in [('Healthy', 0), ('Parkinson', 1), ('healthy', 0), ('parkinson', 1)]:
-        class_dir = os.path.join(source_dir, cls)
-        if not os.path.isdir(class_dir):
+    for cls_dir in data_root.iterdir():
+        if not cls_dir.is_dir():
             continue
-
-        for root, _, files in os.walk(class_dir):
-            for f in files:
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')):
-                    p = os.path.join(root, f)
-                    # Extract participant ID from filename
-                    pid = os.path.splitext(f)[0].split('_')[0]
-                    rows.append({'path': p, 'label': lab, 'participant_id': pid})
+        label_key = cls_dir.name.lower()
+        if label_key not in class_map:
+            continue
+        label = class_map[label_key]
+        for file_path in cls_dir.rglob("*"):
+            if file_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+                continue
+            participant_id, eye = parse_participant_id_and_eye(file_path.name)
+            rows.append(
+                {
+                    "participant_id": str(participant_id),
+                    "eye": eye,
+                    "label": label,
+                    "path": str(file_path),
+                }
+            )
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise RuntimeError("No images found under SOURCE_DIR.")
+        raise RuntimeError(f"No fundus images found under: {data_dir}")
     return df
 
 
+def pair_bilateral_images(df_eye: pd.DataFrame) -> pd.DataFrame:
+    """Collapse eye-level rows into participant-level bilateral rows."""
+    rows = []
+    for pid, g in df_eye.groupby("participant_id", sort=False):
+        label = int(g["label"].iloc[0])
+        od_path = None
+        os_path = None
+        for _, r in g.iterrows():
+            eye = r.get("eye")
+            if eye == "OD":
+                od_path = r["path"]
+            elif eye == "OS":
+                os_path = r["path"]
+        # If the eye side is not parseable, attempt filename heuristics.
+        if od_path is None and os_path is None and len(g) == 2:
+            od_path = g.iloc[0]["path"]
+            os_path = g.iloc[1]["path"]
+
+        rows.append(
+            {
+                "participant_id": pid,
+                "label": label,
+                "od_path": od_path,
+                "os_path": os_path,
+                "n_eyes": int(pd.notna(od_path)) + int(pd.notna(os_path)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    out["n_eyes"] = out["n_eyes"].astype(int)
+    return out
+
+
+def load_optional_metadata(metadata_path: Optional[str]) -> pd.DataFrame:
+    if metadata_path is None:
+        return pd.DataFrame()
+    p = Path(metadata_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    if p.suffix.lower() in {".csv"}:
+        df = pd.read_csv(p)
+    elif p.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(p)
+    else:
+        raise ValueError("metadata_path must be .csv, .xlsx, or .xls")
+    return df
+
+
+# ======================
+# Preprocessing
+# ======================
+
+
+def retina_preprocessing(img_bgr: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
+    """Retina-specific preprocessing aligned with the thesis methods.
+
+    Steps:
+    - BGR -> LAB
+    - CLAHE on L channel
+    - Vessel-focused masking using green channel + Gaussian blur + Otsu
+    - Resize and normalize
+    """
+    try:
+        if img_bgr is None or img_bgr.size == 0:
+            raise ValueError("Empty image")
+
+        img_bgr = img_bgr.astype(np.uint8)
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l)
+        lab2 = cv2.merge([l2, a, b])
+        rgb = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+        green = rgb[:, :, 1]
+        blurred = cv2.GaussianBlur(green, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask = np.repeat(thresh[:, :, None], 3, axis=2)
+        masked = cv2.bitwise_and(rgb, mask)
+
+        resized = cv2.resize(masked, image_size, interpolation=cv2.INTER_AREA)
+        return resized.astype(np.float32) / 255.0
+    except Exception:
+        return np.zeros((*image_size, 3), dtype=np.float32)
+
+
+def load_image(path: Optional[str], image_size: Tuple[int, int]) -> np.ndarray:
+    if path is None or (isinstance(path, float) and np.isnan(path)):
+        return np.zeros((*image_size, 3), dtype=np.float32)
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        return np.zeros((*image_size, 3), dtype=np.float32)
+    return retina_preprocessing(img, image_size)
+
+
+# ======================
+# Augmentation
+# ======================
+
+
+def _affine_transform(img: np.ndarray, matrix: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
+    return cv2.warpAffine(
+        img,
+        matrix,
+        dsize=(out_size[1], out_size[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+
+def augment_pair(img1: np.ndarray, img2: np.ndarray, cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply the same random geometric transform to both eyes, then mild photometric changes."""
+    h, w = img1.shape[:2]
+    assert img1.shape == img2.shape
+
+    # Random geometric parameters
+    angle = random.uniform(-cfg.rotation_deg, cfg.rotation_deg)
+    tx = random.uniform(-cfg.shift_frac, cfg.shift_frac) * w
+    ty = random.uniform(-cfg.shift_frac, cfg.shift_frac) * h
+    shear = random.uniform(-cfg.shear_frac, cfg.shear_frac)
+    zoom = 1.0 + random.uniform(-cfg.zoom_frac, cfg.zoom_frac)
+
+    # Compose an affine matrix (rotation + zoom + shear + translation)
+    center = (w / 2.0, h / 2.0)
+    rot = cv2.getRotationMatrix2D(center, angle, zoom)
+    rot[0, 1] += shear
+    rot[1, 0] += shear
+    rot[0, 2] += tx
+    rot[1, 2] += ty
+
+    img1 = _affine_transform(img1, rot, cfg.image_size)
+    img2 = _affine_transform(img2, rot, cfg.image_size)
+
+    if random.random() < 0.5:
+        img1 = cv2.flip(img1, 1)
+        img2 = cv2.flip(img2, 1)
+    if random.random() < 0.2:
+        img1 = cv2.flip(img1, 0)
+        img2 = cv2.flip(img2, 0)
+
+    brightness = random.uniform(cfg.brightness_low, cfg.brightness_high)
+    img1 = np.clip(img1 * brightness, 0.0, 1.0)
+    img2 = np.clip(img2 * brightness, 0.0, 1.0)
+
+    # Small Gaussian noise
+    if random.random() < 0.35:
+        noise1 = np.random.normal(0.0, 0.02, img1.shape).astype(np.float32)
+        noise2 = np.random.normal(0.0, 0.02, img2.shape).astype(np.float32)
+        img1 = np.clip(img1 + noise1, 0.0, 1.0)
+        img2 = np.clip(img2 + noise2, 0.0, 1.0)
+
+    return img1.astype(np.float32), img2.astype(np.float32)
+
+
+# ======================
+# Dataset sequences
+# ======================
+
+
+class BilateralFundusSequence(tf.keras.utils.Sequence):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        image_size: Tuple[int, int],
+        batch_size: int,
+        shuffle: bool = True,
+        augment: bool = False,
+        config: Optional[Config] = None,
+        sample_weights: Optional[np.ndarray] = None,
+    ):
+        self.df = df.reset_index(drop=True).copy()
+        self.image_size = image_size
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.augment = augment
+        self.config = config or Config()
+        self.sample_weights = sample_weights
+        self.indices = np.arange(len(self.df))
+        self.on_epoch_end()
+
+    def __len__(self) -> int:
+        return int(math.ceil(len(self.df) / self.batch_size))
+
+    def on_epoch_end(self) -> None:
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def __getitem__(self, idx: int):
+        batch_idx = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        batch = self.df.iloc[batch_idx]
+
+        od_imgs = []
+        os_imgs = []
+        labels = []
+        sw = []
+
+        for _, r in batch.iterrows():
+            od = load_image(r.get("od_path"), self.image_size)
+            os_img = load_image(r.get("os_path"), self.image_size)
+            if self.augment:
+                od, os_img = augment_pair(od, os_img, self.config)
+            od_imgs.append(od)
+            os_imgs.append(os_img)
+            labels.append(float(r["label"]))
+            if self.sample_weights is not None:
+                sw.append(float(self.sample_weights[r.name]))
+
+        X = {"od_input": np.asarray(od_imgs, dtype=np.float32), "os_input": np.asarray(os_imgs, dtype=np.float32)}
+        y = np.asarray(labels, dtype=np.float32)
+        if self.sample_weights is not None:
+            return X, y, np.asarray(sw, dtype=np.float32)
+        return X, y
+
+
+# ======================
+# Losses and weighting
+# ======================
+
+
+def focal_loss(alpha: float = 0.65, gamma: float = 2.0):
+    """Binary focal loss on probabilities."""
+    alpha = float(alpha)
+    gamma = float(gamma)
+
+    def loss_fn(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        pt = tf.where(tf.equal(y_true, 1.0), y_pred, 1.0 - y_pred)
+        at = tf.where(tf.equal(y_true, 1.0), alpha, 1.0 - alpha)
+        return tf.reduce_mean(-at * tf.pow(1.0 - pt, gamma) * tf.math.log(pt))
+
+    return loss_fn
+
+
+def compute_overlap_weights(df: pd.DataFrame, age_col: str = "age", sex_col: str = "sex") -> np.ndarray:
+    """Overlap weighting based on a propensity model e(age[, sex])
+
+    Returns normalized sample weights with mean ~ 1.
+    If age is unavailable, returns all-ones.
+    """
+    if age_col not in df.columns:
+        return np.ones(len(df), dtype=np.float32)
+
+    work = df.copy()
+    age = pd.to_numeric(work[age_col], errors="coerce").astype(float)
+    age = age.fillna(age.median())
+    z = (age - age.mean()) / (age.std() + 1e-8)
+
+    X = pd.DataFrame({"z": z, "z2": z**2})
+    if sex_col in work.columns:
+        sex = work[sex_col].astype(str).str.lower().map({"m": 1, "male": 1, "1": 1, "f": 0, "female": 0, "0": 0})
+        sex = sex.fillna(sex.median() if not sex.dropna().empty else 0)
+        X["sex"] = sex
+        X["z_sex"] = z * sex
+
+    y = work["label"].astype(int).values
+
+    lr = LogisticRegression(max_iter=2000, solver="lbfgs")
+    lr.fit(X.values, y)
+    e = lr.predict_proba(X.values)[:, 1]
+    w = np.where(y == 1, 1.0 - e, e)
+    w = np.clip(w, 1e-3, None)
+    w = w / np.mean(w)
+    return w.astype(np.float32)
+
+
+def class_balanced_weights(y: Sequence[int]) -> Dict[int, float]:
+    y = np.asarray(y).astype(int)
+    n0 = max(1, int((y == 0).sum()))
+    n1 = max(1, int((y == 1).sum()))
+    total = len(y)
+    return {0: total / (2.0 * n0), 1: total / (2.0 * n1)}
+
+
+# ======================
+# Model blocks
+# ======================
+
+
+class ChannelAttention(Layer):
+    def __init__(self, reduction: int = 8, **kwargs):
+        super().__init__(**kwargs)
+        self.reduction = reduction
+
+    def build(self, input_shape):
+        channels = int(input_shape[-1])
+        hidden = max(8, channels // self.reduction)
+        self.fc1 = Dense(hidden, activation="relu", kernel_initializer="he_normal", use_bias=True)
+        self.fc2 = Dense(channels, activation="sigmoid", kernel_initializer="he_normal", use_bias=True)
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        avg = tf.reduce_mean(x, axis=[1, 2], keepdims=True)
+        mx = tf.reduce_max(x, axis=[1, 2], keepdims=True)
+        avg_out = self.fc2(self.fc1(avg))
+        max_out = self.fc2(self.fc1(mx))
+        scale = avg_out + max_out
+        return x * scale, scale
+
+
+class SpatialAttention(Layer):
+    def __init__(self, kernel_size: int = 7, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+
+    def build(self, input_shape):
+        self.conv = Conv2D(1, kernel_size=self.kernel_size, padding="same", activation="sigmoid", use_bias=False)
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        avg_pool = tf.reduce_mean(x, axis=-1, keepdims=True)
+        max_pool = tf.reduce_max(x, axis=-1, keepdims=True)
+        concat = tf.concat([avg_pool, max_pool], axis=-1)
+        attn = self.conv(concat)
+        return x * attn, attn
+
+
+class MultiScaleBlock(Layer):
+    def __init__(self, filters: int = 128, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+
+    def build(self, input_shape):
+        self.conv1 = Conv2D(self.filters, (1, 1), padding="same", activation="swish", kernel_initializer="he_normal")
+        self.conv3 = Conv2D(self.filters, (3, 3), padding="same", activation="swish", kernel_initializer="he_normal")
+        self.conv5 = Conv2D(self.filters, (5, 5), padding="same", activation="swish", kernel_initializer="he_normal")
+        self.fuse = Conv2D(self.filters * 2, (3, 3), padding="same", activation="swish", kernel_initializer="he_normal")
+        self.bn = BatchNormalization()
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        c1 = self.conv1(x)
+        c3 = self.conv3(x)
+        c5 = self.conv5(x)
+        x = Concatenate()([c1, c3, c5])
+        x = self.fuse(x)
+        x = self.bn(x, training=training)
+        return x
+
+
+class BilateralAverage(Layer):
+    def call(self, inputs, training=None):
+        od, os = inputs
+        return (od + os) / 2.0
+
+
+# ======================
+# Model builders
+# ======================
+
+
+def build_eye_encoder(cfg: Config, name: str = "eye_encoder") -> Model:
+    """Shared-weight eye encoder.
+
+    Each eye is encoded independently, then passed through attention + multi-scale blocks,
+    and finally converted to a per-eye probability.
+    """
+    inputs = Input(shape=(*cfg.image_size, 3), name=f"{name}_input")
+
+    base = EfficientNetV2B1(include_top=False, weights="imagenet", input_shape=(*cfg.image_size, 3))
+    for layer in base.layers[: cfg.freeze_layers]:
+        layer.trainable = False
+
+    x = base(inputs)
+    x, _ = ChannelAttention(reduction=8, name=f"{name}_channel_attn_1")(x)
+    x, _ = SpatialAttention(kernel_size=7, name=f"{name}_spatial_attn_1")(x)
+    x = MultiScaleBlock(filters=128, name=f"{name}_multiscale")(x)
+    x, _ = ChannelAttention(reduction=8, name=f"{name}_channel_attn_2")(x)
+    x = GlobalAveragePooling2D(name=f"{name}_gap")(x)
+    x = Dropout(cfg.dropout_rate, name=f"{name}_dropout_1")(x)
+    x = Dense(256, activation="swish", kernel_regularizer=l2(cfg.weight_decay_l2), name=f"{name}_dense_1")(x)
+    x = BatchNormalization(name=f"{name}_bn_1")(x)
+    x = Dropout(cfg.dropout_rate, name=f"{name}_dropout_2")(x)
+    outputs = Dense(1, activation="sigmoid", name=f"{name}_eye_prob")(x)
+
+    return Model(inputs=inputs, outputs=outputs, name=name)
+
+
+def build_bilateral_fundus_model(cfg: Config) -> Tuple[Model, Model]:
+    """Dual-stream shared-weight bilateral model with participant-level score averaging."""
+    eye_encoder = build_eye_encoder(cfg, name="shared_eye_encoder")
+
+    od_input = Input(shape=(*cfg.image_size, 3), name="od_input")
+    os_input = Input(shape=(*cfg.image_size, 3), name="os_input")
+
+    od_prob = eye_encoder(od_input)
+    os_prob = eye_encoder(os_input)
+
+    # Participant-level score averaging
+    participant_prob = Average(name="participant_average")([od_prob, os_prob])
+
+    model = Model(inputs={"od_input": od_input, "os_input": os_input}, outputs=participant_prob, name="Bilateral_Fundus_PD")
+    return model, eye_encoder, eye_encoder
+
+
+# ======================
+# Metrics and calibration
+# ======================
+
+
+def find_optimal_threshold(y_true: np.ndarray, y_prob: np.ndarray, min_sens: float = 0.70, min_spec: float = 0.70) -> float:
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    spec = 1.0 - fpr
+    valid = np.where((tpr >= min_sens) & (spec >= min_spec))[0]
+
+    if len(valid) > 0:
+        hmean = 2 * (tpr[valid] * spec[valid]) / (tpr[valid] + spec[valid] + 1e-12)
+        best = valid[np.argmax(hmean)]
+        return float(thresholds[best])
+
+    youden = tpr - fpr
+    return float(thresholds[np.argmax(youden)])
+
+
+def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Dict[str, float]:
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+    y_pred = (y_prob >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    ppv = tp / (tp + fp) if (tp + fp) else 0.0
+    npv = tn / (tn + fn) if (tn + fn) else 0.0
+
+    metrics = {
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "accuracy": float((tp + tn) / max(1, len(y_true))),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+        "ppv": float(ppv),
+        "npv": float(npv),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_prob)),
+        "pr_auc": float(average_precision_score(y_true, y_prob)),
+        "brier_score": float(brier_score_loss(y_true, y_prob)),
+        "threshold": float(threshold),
+        "ppr": float(np.mean(y_pred)),
+    }
+    return metrics
+
+
+class IsotonicCalibrator:
+    def __init__(self):
+        self.iso = IsotonicRegression(out_of_bounds="clip")
+
+    def fit(self, y_score: np.ndarray, y_true: np.ndarray):
+        self.iso.fit(np.asarray(y_score).ravel(), np.asarray(y_true).ravel())
+        return self
+
+    def predict(self, y_score: np.ndarray) -> np.ndarray:
+        return self.iso.transform(np.asarray(y_score).ravel())
+
+
+# ======================
+# Training and CV
+# ======================
+
+
+def build_sequences(
+    df: pd.DataFrame,
+    cfg: Config,
+    augment: bool,
+    shuffle: bool = True,
+    sample_weights: Optional[np.ndarray] = None,
+) -> BilateralFundusSequence:
+    return BilateralFundusSequence(
+        df=df,
+        image_size=cfg.image_size,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle,
+        augment=augment,
+        config=cfg,
+        sample_weights=sample_weights,
+    )
+
+
+def compile_model(model: Model, cfg: Config, alpha: float = 0.65, gamma: float = 2.0) -> Model:
+    model.compile(
+        optimizer=Adam(learning_rate=cfg.learning_rate),
+        loss=focal_loss(alpha=alpha, gamma=gamma),
+        metrics=[
+            tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+            tf.keras.metrics.AUC(name="roc_auc"),
+            tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+        ],
+    )
+    return model
+
+
+def train_single_fold(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    cfg: Config,
+    alpha: float = 0.65,
+    gamma: float = 2.0,
+) -> Tuple[Model, Model, Dict[str, float], np.ndarray, np.ndarray, int]:
+    train_sw = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df), dtype=np.float32)
+    val_sw = None
+
+    train_seq = build_sequences(train_df, cfg, augment=True, shuffle=True, sample_weights=train_sw)
+    val_seq = build_sequences(val_df, cfg, augment=False, shuffle=False)
+
+    model, eye_encoder = build_bilateral_fundus_model(cfg)
+    model = compile_model(model, cfg, alpha=alpha, gamma=gamma)
+
+    callbacks = [
+        EarlyStopping(monitor="val_pr_auc", mode="max", patience=5, restore_best_weights=True),
+        ReduceLROnPlateau(monitor="val_loss", mode="min", factor=0.5, patience=3, min_lr=1e-6),
+        TerminateOnNaN(),
+    ]
+
+    # Sequence can return sample weights; Keras accepts them if the sequence returns (x, y, sw)
+    history = model.fit(
+        train_seq,
+        validation_data=val_seq,
+        epochs=cfg.epochs,
+        verbose=1,
+        callbacks=callbacks,
+    )
+
+    y_val = val_df["label"].astype(int).values
+    y_prob = model.predict(val_seq, verbose=0).ravel()
+
+    return eye_encoder, model, {k: float(v[-1]) for k, v in history.history.items()}, y_val, y_prob, int(np.argmax(history.history.get("val_pr_auc", [0.0])) + 1)
+
+
+def cross_validated_oof_predictions(
+    train_df: pd.DataFrame,
+    cfg: Config,
+    alpha: float = 0.65,
+    gamma: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray, List[int], List[float]]:
+    """Generate out-of-fold predictions on TRAIN only."""
+    y = train_df["label"].astype(int).values
+    groups = train_df["participant_id"].values
+    splitter = StratifiedGroupKFold(n_splits=cfg.folds, shuffle=True, random_state=cfg.random_seed)
+
+    oof_prob = np.zeros(len(train_df), dtype=np.float32)
+    fold_best_epochs: List[int] = []
+    fold_val_scores: List[float] = []
+
+    for fold, (tr_idx, va_idx) in enumerate(splitter.split(train_df, y, groups=groups), start=1):
+        tr_df = train_df.iloc[tr_idx].reset_index(drop=True)
+        va_df = train_df.iloc[va_idx].reset_index(drop=True)
+
+        eye_encoder, model, hist_last, y_val, y_prob, best_epoch = train_single_fold(tr_df, va_df, cfg, alpha=alpha, gamma=gamma)
+        oof_prob[va_idx] = y_prob
+        fold_best_epochs.append(best_epoch)
+        fold_val_scores.append(float(average_precision_score(y_val, y_prob)))
+        print(f"Fold {fold}: best_epoch={best_epoch}, val_PR_AUC={fold_val_scores[-1]:.4f}")
+
+    return y, oof_prob, fold_best_epochs, fold_val_scores
+
+
+def fit_final_model(
+    train_df: pd.DataFrame,
+    cfg: Config,
+    epochs: int,
+    alpha: float = 0.65,
+    gamma: float = 2.0,
+) -> Tuple[Model, Model]:
+    train_sw = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df), dtype=np.float32)
+    train_seq = build_sequences(train_df, cfg, augment=True, shuffle=True, sample_weights=train_sw)
+
+    model, eye_encoder = build_bilateral_fundus_model(cfg)
+    model = compile_model(model, cfg, alpha=alpha, gamma=gamma)
+    model.fit(
+        train_seq,
+        epochs=max(1, int(epochs)),
+        verbose=1,
+        callbacks=[ReduceLROnPlateau(monitor="loss", mode="min", factor=0.5, patience=3, min_lr=1e-6), TerminateOnNaN()],
+    )
+    return model
+
+
+# ======================
+# XAI
+# ======================
+
+
+def find_last_conv_layer(model: Model) -> str:
+    for sublayer in reversed(model.layers):
+        if isinstance(sublayer, tf.keras.layers.Conv2D):
+            return sublayer.name
+    raise ValueError("No Conv2D layer found for Grad-CAM.")
+
+
+def gradcam_for_eye_encoder(eye_encoder: Model, eye_img: np.ndarray, image_size: Tuple[int, int], last_conv_layer_name: str) -> np.ndarray:
+    """Grad-CAM for the shared eye encoder."""
+    # Rebuild a feature model for the encoder itself.
+    conv_layer = eye_encoder.get_layer(last_conv_layer_name)
+    grad_model = Model(inputs=eye_encoder.input, outputs=[conv_layer.output, eye_encoder.output])
+    img = np.expand_dims(eye_img.astype(np.float32), axis=0)
+
+    with tf.GradientTape() as tape:
+        conv_outputs, preds = grad_model(img)
+        loss = preds[:, 0]
+
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-8)
+    heatmap = cv2.resize(heatmap.numpy(), (image_size[1], image_size[0]))
+    return heatmap
+
+
+def save_gradcam_panel(eye_img: np.ndarray, heatmap: np.ndarray, save_path: Path) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+    axes[0].imshow(eye_img)
+    axes[0].set_title("Original eye image")
+    axes[0].axis("off")
+    axes[1].imshow(eye_img)
+    axes[1].imshow(heatmap, cmap="jet", alpha=0.45)
+    axes[1].set_title("Grad-CAM")
+    axes[1].axis("off")
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def extract_vessel_mask(image_rgb: np.ndarray, vessel_threshold: float = 0.10) -> np.ndarray:
+    gray = cv2.cvtColor((image_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    vessels = frangi(gray, scale_range=(1, 3), scale_step=2, beta1=0.5, beta2=15, black_ridges=False)
+    vessel_mask = (vessels > vessel_threshold).astype(np.uint8)
+    return vessel_mask
+
+
+def vessel_aware_lime_explain(
+    model: Model,
+    image_rgb: np.ndarray,
+    vessel_mask: np.ndarray,
+    save_path: str,
+    num_samples: int = 1000,
+):
+    explainer = lime_image.LimeImageExplainer()
+
+    def predict_fn(img_batch: np.ndarray) -> np.ndarray:
+        # For bilateral model, explain the OD branch using the same image as OD and zero OS.
+        od = img_batch.astype(np.float32)
+        os_zeros = np.zeros_like(od, dtype=np.float32)
+        preds = model.predict({"od_input": od, "os_input": os_zeros}, verbose=0)
+        return np.hstack([1.0 - preds, preds])
+
+    def segmentation_fn(img: np.ndarray):
+        vessel_channel = cv2.resize(vessel_mask, (img.shape[1], img.shape[0]))
+        four_channel = np.dstack([img, vessel_channel])
+        segments = segmentation.slic(four_channel, n_segments=50, compactness=10, sigma=1, start_label=0)
+        return segments
+
+    explanation = explainer.explain_instance(
+        image_rgb,
+        predict_fn,
+        top_labels=1,
+        hide_color=0,
+        num_samples=num_samples,
+        segmentation_fn=segmentation_fn,
+    )
+
+    temp, mask = explanation.get_image_and_mask(
+        explanation.top_labels[0],
+        positive_only=True,
+        num_features=10,
+        hide_rest=False,
+    )
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    ax[0].imshow(image_rgb)
+    ax[0].set_title("Original")
+    ax[0].axis("off")
+
+    ax[1].imshow(vessel_mask, cmap="gray")
+    ax[1].set_title("Vessel mask")
+    ax[1].axis("off")
+
+    ax[2].imshow(lime_image.mark_boundaries(temp / 255.0, mask))
+    ax[2].set_title("Vessel-aware LIME")
+    ax[2].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return explanation
+
+
+# ======================
+# Plotting
+# ======================
+
+
+def plot_performance_panels(
+    y_true: np.ndarray,
+    y_prob_raw: np.ndarray,
+    y_prob_cal: np.ndarray,
+    threshold: float,
+    title_prefix: str,
+    out_dir: Path,
+    prefix: str,
+):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    y_pred = (y_prob_cal >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    # Confusion matrix
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    cm = np.array([[tn, fp], [fn, tp]])
+    im = ax.imshow(cm, interpolation="nearest")
+    ax.set_title(f"{title_prefix} Confusion Matrix")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["HC", "PD"])
+    ax.set_yticklabels(["HC", "PD"])
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, cm[i, j], ha="center", va="center", color="white" if cm[i, j] > cm.max() / 2 else "black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_confusion_matrix.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # ROC / PR curves
+    fpr, tpr, roc_th = roc_curve(y_true, y_prob_cal)
+    prec, rec, pr_th = precision_recall_curve(y_true, y_prob_cal)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    axes[0].plot(fpr, tpr, label=f"ROC AUC = {roc_auc_score(y_true, y_prob_cal):.3f}")
+    axes[0].plot([0, 1], [0, 1], linestyle="--", color="gray")
+    axes[0].scatter(*roc_curve_point(y_true, y_prob_cal, threshold), s=60, label=f"thr={threshold:.3f}")
+    axes[0].set_xlabel("False Positive Rate")
+    axes[0].set_ylabel("True Positive Rate")
+    axes[0].set_title(f"{title_prefix} ROC")
+    axes[0].legend(loc="lower right")
+
+    axes[1].plot(rec, prec, label=f"AP = {average_precision_score(y_true, y_prob_cal):.3f}")
+    base_rate = np.mean(y_true)
+    axes[1].plot([0, 1], [base_rate, base_rate], linestyle="--", color="gray", label=f"Prevalence = {base_rate:.2f}")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel("Precision")
+    axes[1].set_title(f"{title_prefix} PR")
+    axes[1].legend(loc="lower left")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_roc_pr.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Score histogram
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    ax.hist(y_prob_cal[y_true == 0], bins=20, alpha=0.6, label="HC")
+    ax.hist(y_prob_cal[y_true == 1], bins=20, alpha=0.6, label="PD")
+    ax.axvline(threshold, linestyle="--")
+    ax.set_xlabel("Calibrated probability")
+    ax.set_ylabel("Count")
+    ax.set_title(f"{title_prefix} Scores")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_score_hist.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Reliability diagram
+    frac_pos_raw, mean_pred_raw = calibration_curve(y_true, y_prob_raw, n_bins=10, strategy="quantile")
+    frac_pos_cal, mean_pred_cal = calibration_curve(y_true, y_prob_cal, n_bins=10, strategy="quantile")
+    brier_raw = brier_score_loss(y_true, y_prob_raw)
+    brier_cal = brier_score_loss(y_true, y_prob_cal)
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Ideal")
+    ax.plot(mean_pred_raw, frac_pos_raw, marker="o", label=f"Raw (Brier={brier_raw:.3f})")
+    ax.plot(mean_pred_cal, frac_pos_cal, marker="o", label=f"Calibrated (Brier={brier_cal:.3f})")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Fraction positive")
+    ax.set_title(f"{title_prefix} Calibration")
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{prefix}_calibration.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def roc_curve_point(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Tuple[float, float]:
+    y_pred = (y_prob >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    tpr = tp / (tp + fn) if (tp + fn) else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0
+    return fpr, tpr
+
+
+# ======================
+# Main pipeline
+# ======================
+
+
+def load_participant_metadata(cfg: Config) -> pd.DataFrame:
+    df_eye = build_image_dataframe(cfg.data_dir, class_names=cfg.class_names)
+    meta = load_optional_metadata(cfg.metadata_path)
+
+    if not meta.empty:
+        # Must contain participant_id and label at minimum; age/sex optional.
+        if "participant_id" not in meta.columns:
+            raise ValueError("Metadata must contain a participant_id column.")
+        if "label" in meta.columns:
+            pass
+        else:
+            # Derive label from directory-based image labels if metadata lacks it.
+            label_map = df_eye.groupby("participant_id")["label"].first().to_dict()
+            meta["label"] = meta["participant_id"].astype(str).map(label_map)
+        meta = meta.copy()
+        meta["participant_id"] = meta["participant_id"].astype(str)
+        meta = meta.drop_duplicates("participant_id")
+
+        df_part = pair_bilateral_images(df_eye)
+        df_part["participant_id"] = df_part["participant_id"].astype(str)
+        merged = df_part.merge(meta, on="participant_id", how="left", suffixes=("", "_meta"))
+        if "label_meta" in merged.columns:
+            merged["label"] = merged["label_meta"].fillna(merged["label"]).astype(int)
+            merged = merged.drop(columns=["label_meta"])
+        return merged
+
+    return pair_bilateral_images(df_eye)
+
+
+def split_train_holdout(df_part: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    train_df, holdout_df = train_test_split(
+        df_part,
+        test_size=cfg.holdout_split,
+        stratify=df_part["label"],
+        random_state=cfg.random_seed,
+    )
+    return train_df.reset_index(drop=True), holdout_df.reset_index(drop=True)
+
+
+def run_pipeline(cfg: Config) -> Dict[str, dict]:
+    set_global_seed(cfg.random_seed)
+    if cfg.mixed_precision:
+        try:
+            from tensorflow.keras import mixed_precision
+
+            mixed_precision.set_global_policy("mixed_float16")
+        except Exception:
+            pass
+
+    out_dir = ensure_dir(cfg.output_dir)
+    ensure_dir(out_dir / "models")
+    ensure_dir(out_dir / "xai")
+    ensure_dir(out_dir / "figures")
+
+    print("Loading data...")
+    df_part = load_participant_metadata(cfg)
+    print(f"Participants loaded: {len(df_part)}")
+    print(df_part[["label"]].value_counts().sort_index())
+
+    train_df, holdout_df = split_train_holdout(df_part, cfg)
+    print(f"TRAIN: {len(train_df)} participants | HOLDOUT: {len(holdout_df)} participants")
+
+    # Cross-validation on TRAIN for OOF calibration/threshold selection
+    print("\nGenerating TRAIN OOF predictions with StratifiedGroupKFold...")
+    y_train, oof_prob, fold_best_epochs, fold_val_ap = cross_validated_oof_predictions(train_df, cfg)
+
+    calibrator = IsotonicCalibrator().fit(oof_prob, y_train)
+    oof_prob_cal = calibrator.predict(oof_prob)
+    threshold = find_optimal_threshold(
+        y_train,
+        oof_prob_cal,
+        min_sens=cfg.min_sensitivity_fundus,
+        min_spec=cfg.min_specificity_fundus,
+    )
+
+    oof_metrics = evaluate_predictions(y_train, oof_prob_cal, threshold)
+    print("TRAIN OOF metrics:", oof_metrics)
+
+    # Train final model on full TRAIN using median best epoch from folds
+    final_epochs = int(np.clip(np.median(fold_best_epochs), 5, cfg.epochs))
+    print(f"\nTraining final model on full TRAIN for {final_epochs} epochs...")
+    final_model, eye_encoder = fit_final_model(train_df, cfg, epochs=final_epochs)
+
+    # Hold-out evaluation
+    hold_seq = build_sequences(holdout_df, cfg, augment=False, shuffle=False)
+    y_hold = holdout_df["label"].astype(int).values
+    y_hold_prob_raw = final_model.predict(hold_seq, verbose=0).ravel()
+    y_hold_prob_cal = calibrator.predict(y_hold_prob_raw)
+
+    hold_metrics = evaluate_predictions(y_hold, y_hold_prob_cal, threshold)
+    print("HOLDOUT metrics:", hold_metrics)
+
+    # Confidence intervals
+    tn, fp, fn, tp = hold_metrics["tn"], hold_metrics["fp"], hold_metrics["fn"], hold_metrics["tp"]
+    sens_ci = wilson_ci(tp, tp + fn)
+    spec_ci = wilson_ci(tn, tn + fp)
+    ppv_ci = wilson_ci(tp, tp + fp)
+    npv_ci = wilson_ci(tn, tn + fn)
+
+    ci_block = {
+        "sensitivity_ci_95": sens_ci,
+        "specificity_ci_95": spec_ci,
+        "ppv_ci_95": ppv_ci,
+        "npv_ci_95": npv_ci,
+    }
+
+    # Save plots
+    plot_performance_panels(
+        y_true=y_hold,
+        y_prob_raw=y_hold_prob_raw,
+        y_prob_cal=y_hold_prob_cal,
+        threshold=threshold,
+        title_prefix="Fundus model (hold-out)",
+        out_dir=out_dir / "figures",
+        prefix="fundus_holdout",
+    )
+
+    # Save models and calibrator
+    final_model.save(out_dir / "models" / "fundus_final_model.keras")
+    eye_encoder.save(out_dir / "models" / "fundus_eye_encoder.keras")
+    joblib.dump(calibrator, out_dir / "models" / "fundus_isotonic_calibrator.joblib")
+    joblib.dump({"threshold": threshold, "config": asdict(cfg)}, out_dir / "models" / "fundus_threshold_and_config.joblib")
+
+    # XAI on a few hold-out participants
+    print("\nRunning XAI examples...")
+    sample_n = min(cfg.xai_samples, len(holdout_df))
+    sample_idx = np.random.choice(len(holdout_df), size=sample_n, replace=False)
+    last_conv_layer = find_last_conv_layer(eye_encoder)
+
+    xai_outputs = []
+    for i, idx in enumerate(sample_idx):
+        row = holdout_df.iloc[int(idx)]
+        od = load_image(row.get("od_path"), cfg.image_size)
+        os_img = load_image(row.get("os_path"), cfg.image_size)
+
+        # Use both eyes in the model; for Grad-CAM we create the full bilateral input.
+        inputs = {
+            "od_input": np.expand_dims(od, axis=0),
+            "os_input": np.expand_dims(os_img, axis=0),
+        }
+        pred = float(final_model.predict(inputs, verbose=0).ravel()[0])
+
+        # Grad-CAM on OD input with contralateral eye preserved
+        # Note: for a concise GitHub implementation, we visualize the OD stream using the full bilateral input.
+        vessel_mask = extract_vessel_mask(od, vessel_threshold=cfg.vessel_threshold)
+        xai_path = out_dir / "xai" / f"participant_{i+1:02d}_{row['participant_id']}_lime.png"
+        try:
+            vessel_aware_lime_explain(final_model, od, vessel_mask, str(xai_path), num_samples=cfg.lime_samples)
+        except Exception as e:
+            print(f"LIME failed for {row['participant_id']}: {e}")
+
+        # Grad-CAM on the shared eye encoder
+        try:
+            gradcam = gradcam_for_eye_encoder(eye_encoder, od, cfg.image_size, last_conv_layer)
+            save_gradcam_panel(od, gradcam, out_dir / "xai" / f"participant_{i+1:02d}_{row['participant_id']}_gradcam.png")
+        except Exception as e:
+            print(f"Grad-CAM failed for {row['participant_id']}: {e}")
+
+        xai_outputs.append(
+            {
+                "participant_id": row["participant_id"],
+                "label": int(row["label"]),
+                "pred_prob": pred,
+                "od_path": row.get("od_path"),
+                "os_path": row.get("os_path"),
+            }
+        )
+
+    # Save summary artifacts
+    results = {
+        "config": asdict(cfg),
+        "dataset": {
+            "n_participants_total": int(len(df_part)),
+            "n_train": int(len(train_df)),
+            "n_holdout": int(len(holdout_df)),
+            "train_prevalence": float(train_df["label"].mean()),
+            "holdout_prevalence": float(holdout_df["label"].mean()),
+        },
+        "oof_metrics": {**oof_metrics, **ci_block},
+        "holdout_metrics": {**hold_metrics, **{
+            "sensitivity_ci_95": sens_ci,
+            "specificity_ci_95": spec_ci,
+            "ppv_ci_95": ppv_ci,
+            "npv_ci_95": npv_ci,
+        }},
+        "fold_best_epochs": fold_best_epochs,
+        "fold_val_ap": fold_val_ap,
+        "threshold": float(threshold),
+    }
+    write_json(out_dir / "results.json", results)
+
+    if xai_outputs:
+        pd.DataFrame(xai_outputs).to_csv(out_dir / "xai_predictions.csv", index=False)
+
+    print(f"\nDone. Outputs saved to: {out_dir.resolve()}")
+    return results
+
+
+# ======================
+# CLI
+# ======================
+
+
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(description="Bilateral Fundus PD pipeline")
+    parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument("--output_dir", type=str, default="./outputs_fundus")
+    parser.add_argument("--metadata_path", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--holdout_split", type=float, default=0.2)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--no_mixed_precision", action="store_true")
+
+    args = parser.parse_args()
+    cfg = Config(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        metadata_path=args.metadata_path,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        random_seed=args.seed,
+        holdout_split=args.holdout_split,
+        folds=args.folds,
+        mixed_precision=not args.no_mixed_precision,
+    )
+    return cfg
+
+
 if __name__ == "__main__":
-    main()
+    config = parse_args()
+    run_pipeline(config)
