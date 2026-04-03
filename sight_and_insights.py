@@ -1,4 +1,3 @@
-
 """
 Sight & Insights — Fundus-only pipeline for participant-level Parkinson's disease risk stratification.
 
@@ -50,6 +49,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from lime import lime_image
+from skimage.filters import frangi
+from skimage.segmentation import slic
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -64,8 +65,6 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
-from skimage.filters import frangi
-from skimage.segmentation import slic
 from tensorflow.keras import Model
 from tensorflow.keras.applications import EfficientNetV2B1
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TerminateOnNaN
@@ -79,10 +78,13 @@ from tensorflow.keras.layers import (
     GlobalAveragePooling2D,
     Input,
     Layer,
-    Multiply,
 )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.regularizers import l2
+
+# Handle AdamW import based on TensorFlow version
+try:
+    from tensorflow.keras.optimizers import AdamW
+except ImportError:
+    from tensorflow.keras.optimizers.experimental import AdamW
 
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -102,7 +104,7 @@ class Config:
     batch_size: int = 8
     epochs: int = 30
     learning_rate: float = 3e-4
-    weight_decay_l2: float = 1e-5
+    weight_decay: float = 1e-2  # AdamW decoupled weight decay
     dropout_rate: float = 0.4
     freeze_layers: int = 200
 
@@ -113,7 +115,8 @@ class Config:
     min_sensitivity: float = 0.70
     min_specificity: float = 0.70
 
-    rotation_deg: float = 45.0
+    # Aggressive Augmentation (360-degree rotation represented by -180 to +180)
+    rotation_deg: float = 180.0
     shift_frac: float = 0.20
     shear_frac: float = 0.20
     zoom_frac: float = 0.30
@@ -162,9 +165,9 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> Tuple[float, float]:
     if n <= 0:
         return (0.0, 0.0)
     phat = k / n
-    denom = 1.0 + (z**2 / n)
-    center = (phat + z**2 / (2.0 * n)) / denom
-    margin = z * math.sqrt((phat * (1.0 - phat) + z**2 / (4.0 * n)) / n) / denom
+    denom = 1.0 + (z ** 2 / n)
+    center = (phat + z ** 2 / (2.0 * n)) / denom
+    margin = z * math.sqrt((phat * (1.0 - phat) + z ** 2 / (4.0 * n)) / n) / denom
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
@@ -274,28 +277,52 @@ def attach_optional_metadata(df_part: pd.DataFrame, metadata_path: Optional[str]
 
 
 # =============================================================================
-# Preprocessing
+# Preprocessing (Thesis Methodology)
 # =============================================================================
 
 def retina_preprocess(img_bgr: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
+    """
+    Implements: LAB color space -> CLAHE on L (clip=5.0) -> Frangi Vessel Extraction
+    from Green channel -> Red-Orange Vessel Layer -> Screen Blend Fusion.
+    """
     try:
         img_bgr = img_bgr.astype(np.uint8)
+
+        # 1. Convert to LAB and apply CLAHE to Luminance channel
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
-        lab2 = cv2.merge([l, a, b])
-        img = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+        lab_clahe = cv2.merge([l, a, b])
 
-        green = img[:, :, 1]
-        blurred = cv2.GaussianBlur(green, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        mask = np.repeat(thresh[:, :, None], 3, axis=2)
-        img = cv2.bitwise_and(img, mask)
+        # Convert back to RGB and normalize to [0, 1]
+        img_base = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+        img_base_rgb = cv2.cvtColor(img_base, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-        img = cv2.resize(img, image_size, interpolation=cv2.INTER_AREA)
-        return img.astype(np.float32) / 255.0
-    except Exception:
+        # 2. Extract Green Channel and apply Multi-scale Frangi filter
+        green_channel = img_base[:, :, 1]
+        vessels = frangi(green_channel, scale_range=(0.5, 20.0), scale_step=2.0, black_ridges=False)
+
+        # Normalize vessel map
+        v_min, v_max = np.min(vessels), np.max(vessels)
+        vessels = (vessels - v_min) / (v_max - v_min + 1e-8)
+
+        # 3. Create Color Layer (Red-Orange overlay)
+        vessel_color_layer = np.zeros_like(img_base_rgb)
+        vessel_color_layer[:, :, 0] = vessels * 1.0  # R
+        vessel_color_layer[:, :, 1] = vessels * 0.3  # G
+        vessel_color_layer[:, :, 2] = vessels * 0.0  # B
+
+        # 4. Screen Blend: 1 - (1 - Base) * (1 - Blend Layer)
+        screen_blended = 1.0 - (1.0 - img_base_rgb) * (1.0 - vessel_color_layer)
+        screen_blended = np.clip(screen_blended, 0.0, 1.0)
+
+        # 5. Resize
+        img_final = cv2.resize(screen_blended, image_size, interpolation=cv2.INTER_AREA)
+        return img_final
+
+    except Exception as e:
+        print(f"Preprocessing error: {e}")
         return np.zeros((*image_size, 3), dtype=np.float32)
 
 
@@ -353,14 +380,14 @@ def apply_same_affine(img1: np.ndarray, img2: np.ndarray, cfg: Config) -> Tuple[
 
 class BilateralFundusSequence(tf.keras.utils.Sequence):
     def __init__(
-        self,
-        df: pd.DataFrame,
-        image_size: Tuple[int, int],
-        batch_size: int,
-        shuffle: bool = True,
-        augment: bool = False,
-        config: Optional[Config] = None,
-        sample_weights: Optional[np.ndarray] = None,
+            self,
+            df: pd.DataFrame,
+            image_size: Tuple[int, int],
+            batch_size: int,
+            shuffle: bool = True,
+            augment: bool = False,
+            config: Optional[Config] = None,
+            sample_weights: Optional[np.ndarray] = None,
     ):
         self.df = df.reset_index(drop=True).copy()
         self.image_size = image_size
@@ -380,7 +407,7 @@ class BilateralFundusSequence(tf.keras.utils.Sequence):
             np.random.shuffle(self.indices)
 
     def __getitem__(self, idx: int):
-        batch_idx = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        batch_idx = self.indices[idx * self.batch_size: (idx + 1) * self.batch_size]
         batch = self.df.iloc[batch_idx]
 
         od_imgs, os_imgs, labels, sw = [], [], [], []
@@ -419,7 +446,7 @@ def compute_overlap_weights(df: pd.DataFrame, age_col: str = "age", sex_col: str
     age = age.fillna(age.median())
     z = (age - age.mean()) / (age.std() + 1e-8)
 
-    X = pd.DataFrame({"z": z, "z2": z**2})
+    X = pd.DataFrame({"z": z, "z2": z ** 2})
     if sex_col in work.columns:
         sex = work[sex_col].astype(str).str.lower().map({"m": 1, "male": 1, "1": 1, "f": 0, "female": 0, "0": 0})
         sex = sex.fillna(sex.median() if not sex.dropna().empty else 0)
@@ -437,7 +464,7 @@ def compute_overlap_weights(df: pd.DataFrame, age_col: str = "age", sex_col: str
 
 
 # =============================================================================
-# Model blocks
+# Model blocks (CBAM & Multi-scale)
 # =============================================================================
 
 class ChannelAttention(Layer):
@@ -507,15 +534,20 @@ def build_eye_encoder(cfg: Config, name: str = "shared_eye_encoder") -> Model:
         layer.trainable = False
 
     x = base(inputs)
+
+    # CBAM & Multi-scale per thesis
     x, _ = ChannelAttention(reduction=8, name=f"{name}_ca1")(x)
     x, _ = SpatialAttention(kernel_size=7, name=f"{name}_sa1")(x)
     x = MultiScaleBlock(filters=128, name=f"{name}_ms")(x)
     x, _ = ChannelAttention(reduction=8, name=f"{name}_ca2")(x)
     x = GlobalAveragePooling2D(name=f"{name}_gap")(x)
+
     x = Dropout(cfg.dropout_rate, name=f"{name}_drop1")(x)
-    x = Dense(256, activation="swish", kernel_regularizer=l2(cfg.weight_decay_l2), name=f"{name}_dense1")(x)
+    # L2 regularizer removed here because AdamW handles decoupled weight decay globally
+    x = Dense(256, activation="swish", name=f"{name}_dense1")(x)
     x = BatchNormalization(name=f"{name}_bn1")(x)
     x = Dropout(cfg.dropout_rate, name=f"{name}_drop2")(x)
+
     outputs = Dense(1, activation="sigmoid", name=f"{name}_eye_prob")(x)
     return Model(inputs=inputs, outputs=outputs, name=name)
 
@@ -548,7 +580,8 @@ def focal_loss(alpha: float = 0.65, gamma: float = 2.0):
 
     def loss_fn(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), tf.keras.backend.epsilon(),
+                                  1.0 - tf.keras.backend.epsilon())
         pt = tf.where(tf.equal(y_true, 1.0), y_pred, 1.0 - y_pred)
         at = tf.where(tf.equal(y_true, 1.0), alpha, 1.0 - alpha)
         return tf.reduce_mean(-at * tf.pow(1.0 - pt, gamma) * tf.math.log(pt))
@@ -624,13 +657,13 @@ def roc_curve_point(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) ->
 
 
 def plot_performance_panels(
-    y_true: np.ndarray,
-    y_prob_raw: np.ndarray,
-    y_prob_cal: np.ndarray,
-    threshold: float,
-    title_prefix: str,
-    out_dir: Path,
-    prefix: str,
+        y_true: np.ndarray,
+        y_prob_raw: np.ndarray,
+        y_prob_cal: np.ndarray,
+        threshold: float,
+        title_prefix: str,
+        out_dir: Path,
+        prefix: str,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -707,7 +740,7 @@ def plot_performance_panels(
 
 
 # =============================================================================
-# XAI
+# Explainability (Grad-CAM++ & LIME)
 # =============================================================================
 
 def get_last_conv_layer_name(eye_encoder: Model) -> str:
@@ -717,24 +750,52 @@ def get_last_conv_layer_name(eye_encoder: Model) -> str:
     raise ValueError("No Conv2D layer found in eye encoder for Grad-CAM.")
 
 
-def gradcam_for_eye(eye_encoder: Model, eye_img: np.ndarray) -> np.ndarray:
+def gradcam_plus_plus_for_eye(eye_encoder: Model, eye_img: np.ndarray) -> np.ndarray:
+    """
+    Implementation of Grad-CAM++ to capture multiple target objects 
+    by computing 1st, 2nd, and 3rd derivatives.
+    """
     last_conv_layer_name = get_last_conv_layer_name(eye_encoder)
     conv_layer = eye_encoder.get_layer(last_conv_layer_name)
     grad_model = Model(inputs=eye_encoder.input, outputs=[conv_layer.output, eye_encoder.output])
     img = np.expand_dims(eye_img.astype(np.float32), axis=0)
 
-    with tf.GradientTape() as tape:
-        conv_outputs, preds = grad_model(img)
-        loss = preds[:, 0]
+    with tf.GradientTape() as tape3:
+        with tf.GradientTape() as tape2:
+            with tf.GradientTape() as tape1:
+                conv_outputs, preds = grad_model(img)
+                loss = preds[:, 0]
 
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+            # First derivative
+            first_deriv = tape1.gradient(loss, conv_outputs)
+        # Second derivative
+        second_deriv = tape2.gradient(first_deriv, conv_outputs)
+    # Third derivative
+    third_deriv = tape3.gradient(second_deriv, conv_outputs)
+
+    global_sum = tf.reduce_sum(conv_outputs, axis=(0, 1, 2))
+
+    alpha_num = second_deriv
+    alpha_denom = 2.0 * second_deriv + third_deriv * tf.reshape(global_sum, (1, 1, 1, -1))
+    alpha_denom = tf.where(alpha_denom != 0.0, alpha_denom, tf.ones_like(alpha_denom))
+
+    alphas = alpha_num / alpha_denom
+    weights = tf.maximum(first_deriv, 0.0)
+
+    alpha_normalization = tf.reduce_sum(alphas, axis=(1, 2), keepdims=True)
+    alpha_normalization = tf.where(alpha_normalization != 0.0, alpha_normalization, tf.ones_like(alpha_normalization))
+    alphas = alphas / alpha_normalization
+
+    deep_linearization_weights = tf.reduce_sum(alphas * weights, axis=(1, 2))
+
     conv_outputs = conv_outputs[0]
-    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+    weights = deep_linearization_weights[0]
+
+    heatmap = tf.reduce_sum(tf.multiply(conv_outputs, weights), axis=-1)
     heatmap = tf.maximum(heatmap, 0)
     heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-8)
-    heatmap = cv2.resize(heatmap.numpy(), (eye_img.shape[1], eye_img.shape[0]))
-    return heatmap
+
+    return cv2.resize(heatmap.numpy(), (eye_img.shape[1], eye_img.shape[0]))
 
 
 def extract_vessel_mask(image_rgb: np.ndarray, vessel_threshold: float = 0.10) -> np.ndarray:
@@ -748,21 +809,23 @@ def save_gradcam_panel(eye_img: np.ndarray, heatmap: np.ndarray, save_path: Path
     axes[0].imshow(eye_img)
     axes[0].set_title("Original eye image")
     axes[0].axis("off")
+
     axes[1].imshow(eye_img)
     axes[1].imshow(heatmap, cmap="jet", alpha=0.45)
-    axes[1].set_title("Grad-CAM")
+    axes[1].set_title("Grad-CAM++")
     axes[1].axis("off")
+
     plt.tight_layout()
     fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
 def vessel_aware_lime_explain(
-    model: Model,
-    eye_rgb: np.ndarray,
-    vessel_mask: np.ndarray,
-    save_path: str,
-    num_samples: int = 1000,
+        model: Model,
+        eye_rgb: np.ndarray,
+        vessel_mask: np.ndarray,
+        save_path: str,
+        num_samples: int = 1000,
 ):
     explainer = lime_image.LimeImageExplainer()
 
@@ -817,11 +880,11 @@ def vessel_aware_lime_explain(
 # =============================================================================
 
 def build_sequences(
-    df: pd.DataFrame,
-    cfg: Config,
-    augment: bool,
-    shuffle: bool = True,
-    sample_weights: Optional[np.ndarray] = None,
+        df: pd.DataFrame,
+        cfg: Config,
+        augment: bool,
+        shuffle: bool = True,
+        sample_weights: Optional[np.ndarray] = None,
 ) -> BilateralFundusSequence:
     return BilateralFundusSequence(
         df=df,
@@ -835,8 +898,9 @@ def build_sequences(
 
 
 def compile_model(model: Model, cfg: Config, alpha: float = 0.65, gamma: float = 2.0) -> Model:
+    # Use AdamW for direct weight decay as specified in the thesis
     model.compile(
-        optimizer=Adam(learning_rate=cfg.learning_rate),
+        optimizer=AdamW(learning_rate=cfg.learning_rate, weight_decay=cfg.weight_decay),
         loss=focal_loss(alpha=alpha, gamma=gamma),
         metrics=[
             tf.keras.metrics.BinaryAccuracy(name="accuracy"),
@@ -848,13 +912,14 @@ def compile_model(model: Model, cfg: Config, alpha: float = 0.65, gamma: float =
 
 
 def train_single_fold(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    cfg: Config,
-    alpha: float = 0.65,
-    gamma: float = 2.0,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        cfg: Config,
+        alpha: float = 0.65,
+        gamma: float = 2.0,
 ) -> Tuple[Model, Model, Dict[str, float], np.ndarray, np.ndarray, int]:
-    train_weights = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df), dtype=np.float32)
+    train_weights = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df),
+                                                                                                dtype=np.float32)
 
     train_seq = build_sequences(train_df, cfg, augment=True, shuffle=True, sample_weights=train_weights)
     val_seq = build_sequences(val_df, cfg, augment=False, shuffle=False)
@@ -884,10 +949,10 @@ def train_single_fold(
 
 
 def cross_validated_oof_predictions(
-    train_df: pd.DataFrame,
-    cfg: Config,
-    alpha: float = 0.65,
-    gamma: float = 2.0,
+        train_df: pd.DataFrame,
+        cfg: Config,
+        alpha: float = 0.65,
+        gamma: float = 2.0,
 ):
     y = train_df["label"].astype(int).values
     groups = train_df["participant_id"].values
@@ -913,13 +978,14 @@ def cross_validated_oof_predictions(
 
 
 def fit_final_model(
-    train_df: pd.DataFrame,
-    cfg: Config,
-    epochs: int,
-    alpha: float = 0.65,
-    gamma: float = 2.0,
+        train_df: pd.DataFrame,
+        cfg: Config,
+        epochs: int,
+        alpha: float = 0.65,
+        gamma: float = 2.0,
 ) -> Tuple[Model, Model]:
-    train_weights = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df), dtype=np.float32)
+    train_weights = compute_overlap_weights(train_df) if "age" in train_df.columns else np.ones(len(train_df),
+                                                                                                dtype=np.float32)
     train_seq = build_sequences(train_df, cfg, augment=True, shuffle=True, sample_weights=train_weights)
 
     model, eye_encoder = build_bilateral_model(cfg)
@@ -938,7 +1004,7 @@ def fit_final_model(
 
 
 # =============================================================================
-# Pipeline
+# Pipeline Execution
 # =============================================================================
 
 def load_participant_dataframe(cfg: Config) -> pd.DataFrame:
@@ -981,7 +1047,7 @@ def run_pipeline(cfg: Config) -> Dict[str, dict]:
     train_df, holdout_df = split_train_holdout(df_part, cfg)
     print(f"TRAIN: {len(train_df)} participants | HOLDOUT: {len(holdout_df)} participants")
 
-    # OOF calibration on TRAIN
+    # 1. OOF Calibration on TRAIN set
     print("\nGenerating TRAIN out-of-fold predictions ...")
     y_train, oof_prob, fold_best_epochs, fold_val_ap = cross_validated_oof_predictions(train_df, cfg)
 
@@ -1003,12 +1069,12 @@ def run_pipeline(cfg: Config) -> Dict[str, dict]:
 
     print("TRAIN OOF metrics:", oof_metrics)
 
-    # Final model on full TRAIN
+    # 2. Final model on full TRAIN set
     final_epochs = int(np.clip(np.median(fold_best_epochs), 5, cfg.epochs))
     print(f"\nTraining final model on full TRAIN for {final_epochs} epochs ...")
     final_model, eye_encoder = fit_final_model(train_df, cfg, epochs=final_epochs)
 
-    # Hold-out evaluation
+    # 3. Hold-out evaluation
     hold_seq = build_sequences(holdout_df, cfg, augment=False, shuffle=False)
     y_hold = holdout_df["label"].astype(int).values
     y_hold_prob_raw = final_model.predict(hold_seq, verbose=0).ravel()
@@ -1036,9 +1102,10 @@ def run_pipeline(cfg: Config) -> Dict[str, dict]:
     final_model.save(out_dir / "models" / "fundus_final_model.keras")
     eye_encoder.save(out_dir / "models" / "fundus_eye_encoder.keras")
     joblib.dump(calibrator, out_dir / "models" / "fundus_isotonic_calibrator.joblib")
-    joblib.dump({"threshold": threshold, "config": asdict(cfg)}, out_dir / "models" / "fundus_threshold_and_config.joblib")
+    joblib.dump({"threshold": threshold, "config": asdict(cfg)},
+                out_dir / "models" / "fundus_threshold_and_config.joblib")
 
-    # XAI
+    # 4. XAI (Grad-CAM++ & Vessel-aware LIME)
     print("\nGenerating XAI examples ...")
     sample_n = min(cfg.xai_samples, len(holdout_df))
     sample_idx = np.random.choice(len(holdout_df), size=sample_n, replace=False)
@@ -1049,19 +1116,22 @@ def run_pipeline(cfg: Config) -> Dict[str, dict]:
         od = load_image(row.get("od_path"), cfg.image_size)
         os_img = load_image(row.get("os_path"), cfg.image_size)
 
-        pred = float(final_model.predict({"od_input": od[None, ...], "os_input": os_img[None, ...]}, verbose=0).ravel()[0])
+        pred = float(
+            final_model.predict({"od_input": od[None, ...], "os_input": os_img[None, ...]}, verbose=0).ravel()[0])
 
         try:
-            od_cam = gradcam_for_eye(eye_encoder, od)
-            save_gradcam_panel(od, od_cam, out_dir / "xai" / f"participant_{i+1:02d}_{row['participant_id']}_OD_gradcam.png")
+            od_cam = gradcam_plus_plus_for_eye(eye_encoder, od)
+            save_gradcam_panel(od, od_cam,
+                               out_dir / "xai" / f"participant_{i + 1:02d}_{row['participant_id']}_OD_gradcam.png")
         except Exception as e:
-            print(f"OD Grad-CAM failed for {row['participant_id']}: {e}")
+            print(f"OD Grad-CAM++ failed for {row['participant_id']}: {e}")
 
         try:
-            os_cam = gradcam_for_eye(eye_encoder, os_img)
-            save_gradcam_panel(os_img, os_cam, out_dir / "xai" / f"participant_{i+1:02d}_{row['participant_id']}_OS_gradcam.png")
+            os_cam = gradcam_plus_plus_for_eye(eye_encoder, os_img)
+            save_gradcam_panel(os_img, os_cam,
+                               out_dir / "xai" / f"participant_{i + 1:02d}_{row['participant_id']}_OS_gradcam.png")
         except Exception as e:
-            print(f"OS Grad-CAM failed for {row['participant_id']}: {e}")
+            print(f"OS Grad-CAM++ failed for {row['participant_id']}: {e}")
 
         try:
             vessel_mask = extract_vessel_mask(od, vessel_threshold=cfg.vessel_threshold)
@@ -1069,7 +1139,7 @@ def run_pipeline(cfg: Config) -> Dict[str, dict]:
                 final_model,
                 od,
                 vessel_mask,
-                str(out_dir / "xai" / f"participant_{i+1:02d}_{row['participant_id']}_OD_lime.png"),
+                str(out_dir / "xai" / f"participant_{i + 1:02d}_{row['participant_id']}_OD_lime.png"),
                 num_samples=cfg.lime_samples,
             )
         except Exception as e:
